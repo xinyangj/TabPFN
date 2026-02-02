@@ -60,6 +60,8 @@ class MultiHeadAttention(Attention):
     _share_kv_across_n_heads: int
     dropout_p: float | None
     softmax_scale: float | None
+    _return_attention_weights: bool
+    _cached_attention_weights: torch.Tensor | None
     _k_cache: torch.Tensor | None
     _v_cache: torch.Tensor | None
     _kv_cache: torch.Tensor | None
@@ -108,6 +110,31 @@ class MultiHeadAttention(Attention):
         self._k_cache = None
         self._v_cache = None
         self._kv_cache = None
+
+    def enable_attention_weights_return(self, enable: bool = True) -> None:
+        """Enable or disable returning of attention weights.
+
+        When enabled, attention weights will be cached during forward pass
+        and can be retrieved via get_attention_weights().
+
+        Parameters
+        ----------
+        enable : bool, default=True
+            Whether to enable attention weights return
+        """
+        self._return_attention_weights = enable
+        if not enable:
+            self._cached_attention_weights = None
+
+    def get_attention_weights(self) -> torch.Tensor | None:
+        """Get cached attention weights from the last forward pass.
+
+        Returns
+        -------
+        attention_weights : torch.Tensor or None
+            Cached attention weights, or None if not enabled or no forward pass yet
+        """
+        return self._cached_attention_weights
 
     def set_parameters(
         self,
@@ -195,6 +222,7 @@ class MultiHeadAttention(Attention):
         precomputed_k: torch.Tensor | None = None,
         precomputed_v: torch.Tensor | None = None,
         precomputed_kv: torch.Tensor | None = None,
+        return_attention_weights: bool = False,
     ):
         super().__init__()
         assert config.nhead % share_kv_across_n_heads == 0
@@ -209,6 +237,8 @@ class MultiHeadAttention(Attention):
         self.dropout_p = dropout_p
         self.softmax_scale = softmax_scale
         self.init_gain = config.attention_init_gain
+        self._return_attention_weights = return_attention_weights
+        self._cached_attention_weights = None
 
         w_out = torch.nn.Parameter(
             torch.empty(
@@ -501,7 +531,7 @@ class MultiHeadAttention(Attention):
             use_cached_kv=use_cached_kv,
             reuse_first_head_kv=reuse_first_head_kv,
         )
-        attention_head_outputs = MultiHeadAttention.compute_attention_heads(
+        attention_head_outputs, attention_weights = MultiHeadAttention.compute_attention_heads(
             q,
             k,
             v,
@@ -509,7 +539,13 @@ class MultiHeadAttention(Attention):
             qkv,
             self.dropout_p,
             self.softmax_scale,
+            return_attention_weights=self._return_attention_weights,
         )
+
+        # Cache attention weights if enabled
+        if self._return_attention_weights and attention_weights is not None:
+            self._cached_attention_weights = attention_weights.detach().clone()
+
         return torch.einsum(
             "... h d, h d s -> ... s",
             attention_head_outputs,
@@ -603,7 +639,17 @@ class MultiHeadAttention(Attention):
         qkv: torch.Tensor | None,
         dropout_p: float | None = None,
         softmax_scale: float | None = None,
-    ) -> torch.Tensor:
+        return_attention_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Compute attention heads.
+
+        Returns
+        -------
+        attention_head_outputs : torch.Tensor
+            The attention output
+        attention_weights : torch.Tensor or None
+            The attention weights (only if return_attention_weights=True)
+        """
         assert (k is None) == (v is None)
         assert sum([qkv is None, kv is None, k is None and v is None]) == 2
         assert (qkv is None) != (q is None)
@@ -623,12 +669,13 @@ class MultiHeadAttention(Attention):
         if dropout_p is None:
             dropout_p = 0.0  # TODO: necessary?
 
-        if TORCH_2_ATTENTION_POSSIBLE:
+        attention_weights: torch.Tensor | None = None
+
+        if TORCH_2_ATTENTION_POSSIBLE and not return_attention_weights:
+            # Use optimized PyTorch 2.0 attention when we don't need weights
             extra_inputs = {}
             if softmax_scale is not None:
-                extra_inputs["scale"] = (
-                    softmax_scale  # defaults to 1/sqrt(d_k) if None or not provided
-                )
+                extra_inputs["scale"] = softmax_scale
 
             # Check if we should use PyTorch 2.0's GQA support
             if USE_TORCH_2_GQA:
@@ -655,16 +702,22 @@ class MultiHeadAttention(Attention):
             attention_head_outputs = attention_head_outputs.transpose(1, 2)
 
         else:
+            # Use fallback path that computes attention weights explicitly
+            # (Either PyTorch < 2.0 or we need to return attention weights)
             k = MultiHeadAttention.broadcast_kv_across_heads(k, share_kv_across_n_heads)
             v = MultiHeadAttention.broadcast_kv_across_heads(v, share_kv_across_n_heads)
+
+            # Compute attention logits
             logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
             logits *= (
                 torch.sqrt(torch.tensor(1.0 / d_k)).to(k.device)
                 if softmax_scale is None
                 else softmax_scale
             )
-            ps = torch.softmax(logits, dim=2)
-            ps = torch.dropout(ps, dropout_p, train=True)
+
+            # Compute attention weights
+            attention_weights = torch.softmax(logits, dim=2)
+            ps = torch.dropout(attention_weights, dropout_p, train=True)
             attention_head_outputs = torch.einsum("b q k h, b k h d -> b q h d", ps, v)
 
         return attention_head_outputs.reshape(
@@ -672,7 +725,7 @@ class MultiHeadAttention(Attention):
             seqlen_q,
             nhead,
             d_v,
-        )
+        ), attention_weights
 
     @staticmethod
     def convert_torch_nn_multihead_attention_state_dict(

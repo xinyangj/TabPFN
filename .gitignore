@@ -165,3 +165,8 @@ cython_debug/
 # Claude AI assistant
 CLAUDE.md
 uv.lock
+.claude/
+
+# GRN datasets and results (too large for git)
+data/
+results/

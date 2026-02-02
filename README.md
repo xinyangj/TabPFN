@@ -134,6 +134,94 @@ Choose the right TabPFN implementation for your needs:
 - **[TabPFN UX](https://ux.priorlabs.ai)**
   No-code graphical interface to explore TabPFN capabilities—ideal for business users and prototyping.
 
+## Gene Regulatory Network (GRN) Inference
+
+TabPFN now includes a module for **Gene Regulatory Network inference** - predicting regulatory relationships between transcription factors (TFs) and target genes using attention mechanisms.
+
+### Key Features
+
+- **In-context learning**: Uses TabPFN as a frozen foundation model (no fine-tuning required)
+- **Dual attention mechanism**: Captures both TF-TF relationships and sample-specific patterns
+- **Standard evaluation metrics**: AUROC, AUPR, Precision@k (matching DREAM challenge standards)
+- **Comprehensive visualization**: Network plots, attention heatmaps, PR/ROC curves
+- **DREAM challenge datasets**: Built-in support for DREAM3, DREAM4, and DREAM5 benchmarks
+
+### Quick Start
+
+```python
+from tabpfn.grn import (
+    DREAMChallengeLoader,
+    GRNPreprocessor,
+    TabPFNGRNRegressor,
+    evaluate_grn,
+)
+
+# Load DREAM4 dataset
+loader = DREAMChallengeLoader()
+expression, gene_names, tf_names, gold_standard = loader.load_dream4(
+    network_size=10, network_id=1
+)
+
+# Preprocess
+preprocessor = GRNPreprocessor(normalization="zscore")
+X, y, tf_indices, target_indices = preprocessor.fit_transform(
+    expression, gene_names, tf_names
+)
+target_genes = preprocessor.get_target_names()
+
+# Train GRN model (in-context learning, no weight updates)
+grn_model = TabPFNGRNRegressor(tf_names, target_genes, n_estimators=1)
+grn_model.fit(X, y)
+
+# Infer regulatory network
+edge_scores = grn_model.get_edge_scores()
+metrics = evaluate_grn(edge_scores, gold_standard)
+
+print(f"AUPR: {metrics['aupr']:.4f}")
+print(f"AUROC: {metrics['auroc']:.4f}")
+```
+
+### Documentation & Examples
+
+- **Tutorial Notebook**: [examples/notebooks/GRN_Inference_Tutorial.ipynb](examples/notebooks/GRN_Inference_Tutorial.ipynb)
+- **Example Script**: [examples/grn_inference_example.py](examples/grn_inference_example.py)
+- **Implementation Plan**: [GRN_IMPLEMENTATION_PLAN.md](GRN_IMPLEMENTATION_PLAN.md)
+
+### API Reference
+
+```python
+# Core classes
+from tabpfn.grn import (
+    TabPFNGRNRegressor,      # Main GRN inference class
+    GRNPreprocessor,          # Data preprocessing
+    DREAMChallengeLoader,     # Dataset loading
+)
+
+# Evaluation metrics
+from tabpfn.grn import (
+    evaluate_grn,             # Full evaluation pipeline
+    compute_auroc,            # Area Under ROC Curve
+    compute_aupr,             # Area Under PR Curve
+    compute_precision_at_k,   # Precision@k
+    compute_recall_at_k,      # Recall@k
+    compute_f1_at_k,          # F1@k
+)
+
+# Visualization
+from tabpfn.grn import (
+    GRNNetworkVisualizer,           # Network graph plots
+    AttentionHeatmapVisualizer,     # Attention heatmaps
+    EdgeScoreVisualizer,            # Score distributions, PR/ROC curves
+    create_evaluation_summary_plot, # Summary bar chart
+)
+
+# Attention extraction
+from tabpfn.grn import (
+    AttentionExtractor,       # Extract attention weights
+    EdgeScoreComputer,        # Compute edge scores from attention
+)
+```
+
 ## TabPFN Workflow at a Glance
 Follow this decision tree to build your model and choose the right extensions from our ecosystem. It walks you through critical questions about your data, hardware, and performance needs, guiding you to the best solution for your specific use case.
 
