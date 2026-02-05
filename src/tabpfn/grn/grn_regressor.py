@@ -176,6 +176,9 @@ class TabPFNGRNRegressor(BaseEstimator):
             model.fit(X, y[:, target_idx])
             self.target_models_[target_name] = model
 
+            # Log pre-trained weight loading information
+            self._log_model_info(model, target_name)
+
             # Extract attention weights
             extractor = AttentionExtractor()
             attention = extractor.extract(model, X, max_layers=1)
@@ -278,6 +281,38 @@ class TabPFNGRNRegressor(BaseEstimator):
                     edge_scores[(tf_name, target_name)] = 0.0
 
         return edge_scores
+
+    def _log_model_info(self, model: TabPFNRegressor, target_name: str) -> None:
+        """Log information about the loaded TabPFN model.
+
+        Parameters
+        ----------
+        model : TabPFNRegressor
+            The fitted TabPFN model
+        target_name : str
+            Name of the target gene
+        """
+        print(f"\n{'='*60}")
+        print(f"TabPFN Pre-trained Weights Loaded for Target: {target_name}")
+        print(f"{'='*60}")
+        print(f"  Model Path: {model.model_path}")
+        print(f"  Number of Estimators: {model.n_estimators}")
+        print(f"  Device(s): {model.devices_}")
+        print(f"  Number of Models Loaded: {len(model.models_)}")
+
+        # Print model architecture info
+        if hasattr(model, "models_") and len(model.models_) > 0:
+            first_model = model.models_[0]
+            print(f"  Model Architecture: {first_model.__class__.__name__}")
+            # Try to get parameter count
+            try:
+                import torch
+                total_params = sum(p.numel() for p in first_model.parameters())
+                print(f"  Total Parameters: {total_params:,}")
+            except Exception:
+                pass  # Parameter count not critical
+
+        print(f"{'='*60}\n")
 
     def predict(
         self, X: npt.NDArray[np.float32]

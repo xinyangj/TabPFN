@@ -6,11 +6,20 @@ evaluating GRN inference methods, including AUROC, AUPR, and Precision@k.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
-from sklearn.metrics import auc, average_precision_score, precision_recall_curve, roc_curve
+from scipy.stats import pearsonr
+from sklearn.metrics import (
+    auc,
+    average_precision_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_recall_curve,
+    r2_score,
+    roc_curve,
+)
 
 if TYPE_CHECKING:
     import networkx as nx
@@ -369,6 +378,142 @@ def compute_f1_at_k(
     f1 = 2 * (precision * recall) / (precision + recall)
 
     return float(f1)
+
+
+def compute_expression_metrics(
+    y_true: npt.NDArray[np.float32],
+    y_pred: npt.NDArray[np.float32],
+) -> dict[str, float]:
+    """Compute regression metrics for expression prediction.
+
+    Computes standard regression metrics to evaluate how well a model
+    predicts target gene expression values from input TF expression.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        True expression values
+    y_pred : np.ndarray
+        Predicted expression values
+
+    Returns
+    -------
+    metrics : dict
+        Dictionary containing:
+        - 'mse': Mean Squared Error
+        - 'rmse': Root Mean Squared Error
+        - 'mae': Mean Absolute Error
+        - 'r2': R² score (coefficient of determination)
+        - 'pearson_r': Pearson correlation coefficient
+        - 'pearson_pval': P-value for Pearson correlation
+
+    Examples
+    --------
+    >>> y_true = np.array([1.0, 2.0, 3.0])
+    >>> y_pred = np.array([1.1, 1.9, 3.2])
+    >>> metrics = compute_expression_metrics(y_true, y_pred)
+    >>> print(f"R²: {metrics['r2']:.3f}")
+    """
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+
+    # Pearson correlation (flatten across all samples/targets)
+    pearson_r, pearson_pval = pearsonr(y_true.ravel(), y_pred.ravel())
+
+    return {
+        "mse": float(mse),
+        "rmse": float(rmse),
+        "mae": float(mae),
+        "r2": float(r2),
+        "pearson_r": float(pearson_r),
+        "pearson_pval": float(pearson_pval),
+    }
+
+
+def evaluate_expression_prediction(
+    model: Any,
+    X_train: npt.NDArray[np.float32],
+    y_train: npt.NDArray[np.float32],
+    X_test: npt.NDArray[np.float32],
+    y_test: npt.NDArray[np.float32],
+    target_names: list[str],
+) -> dict[str, float]:
+    """Evaluate expression prediction accuracy with train/test split.
+
+    This function:
+    1. Trains the model on training data
+    2. Predicts on test data
+    3. Computes regression metrics per target gene
+    4. Aggregates metrics across all targets (mean and std)
+
+    Parameters
+    ----------
+    model : Any
+        Model object with .fit() and .predict() methods.
+        Must accept shape (n_samples, n_features) for X
+        and (n_samples, n_targets) for y.
+    X_train : np.ndarray
+        Training TF expression matrix (n_train_samples, n_TFs)
+    y_train : np.ndarray
+        Training target expression matrix (n_train_samples, n_targets)
+    X_test : np.ndarray
+        Test TF expression matrix (n_test_samples, n_TFs)
+    y_test : np.ndarray
+        Test target expression matrix (n_test_samples, n_targets)
+    target_names : list[str]
+        Names of target genes
+
+    Returns
+    -------
+    aggregated : dict
+        Dictionary with aggregated metrics across all targets:
+        - 'mean_mse', 'std_mse': Mean and std of MSE across targets
+        - 'mean_rmse', 'std_rmse': Mean and std of RMSE across targets
+        - 'mean_mae', 'std_mae': Mean and std of MAE across targets
+        - 'mean_r2', 'std_r2': Mean and std of R² across targets
+        - 'mean_pearson_r', 'std_pearson_r': Mean and std of Pearson r
+
+    Examples
+    --------
+    >>> from sklearn.linear_model import LinearRegression
+    >>> model = LinearRegression()
+    >>> metrics = evaluate_expression_prediction(
+    ...     model, X_train, y_train, X_test, y_test, target_genes
+    ... )
+    >>> print(f"Mean R²: {metrics['mean_r2']:.3f}")
+    """
+    # Train model
+    model.fit(X_train, y_train)
+
+    # Predict
+    y_pred = model.predict(X_test)
+
+    # Handle different prediction formats
+    # TabPFN returns dict, sklearn returns array
+    if isinstance(y_pred, dict):
+        # TabPFN format: dict[target_name] -> array
+        predictions = np.column_stack([y_pred[t] for t in target_names])
+    else:
+        # sklearn format: array of shape (n_samples, n_targets)
+        predictions = y_pred
+
+    # Compute metrics per target
+    target_metrics = {}
+    for i, target in enumerate(target_names):
+        target_metrics[target] = compute_expression_metrics(
+            y_test[:, i], predictions[:, i]
+        )
+
+    # Aggregate (mean and std across targets)
+    aggregated = {}
+    for metric in ["mse", "rmse", "mae", "r2", "pearson_r"]:
+        values = [tm[metric] for tm in target_metrics.values()]
+        aggregated[f"mean_{metric}"] = float(np.mean(values))
+        aggregated[f"std_{metric}"] = float(np.std(values))
+
+    return aggregated
 
 
 def evaluate_grn(

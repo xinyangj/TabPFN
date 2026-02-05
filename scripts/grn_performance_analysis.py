@@ -19,10 +19,312 @@ from tabpfn.grn import (
     GRNPreprocessor,
     TabPFNGRNRegressor,
     evaluate_grn,
+    evaluate_expression_prediction,
     GRNNetworkVisualizer,
     EdgeScoreVisualizer,
     create_evaluation_summary_plot,
 )
+
+
+# ============================================================================
+# Wrapper Classes for Expression Prediction Evaluation
+# ============================================================================
+
+class TabPFNRegressorWrapper:
+    """Wrapper for TabPFNGRNRegressor to provide consistent predict() interface.
+
+    This wrapper converts TabPFN's dict output format to numpy array format
+    for compatibility with the expression evaluation framework.
+    """
+
+    def __init__(
+        self,
+        tf_names: list[str],
+        target_genes: list[str],
+        n_estimators: int = 1,
+        edge_score_strategy: str = "self_attention",
+    ):
+        from tabpfn.grn import TabPFNGRNRegressor
+
+        self.tf_names = tf_names
+        self.target_genes = target_genes
+        self.model = TabPFNGRNRegressor(
+            tf_names=tf_names,
+            target_genes=target_genes,
+            n_estimators=n_estimators,
+            edge_score_strategy=edge_score_strategy,
+        )
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "TabPFNRegressorWrapper":
+        """Fit the TabPFN GRN model.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+        y : np.ndarray
+            Target expression matrix (n_samples, n_targets)
+
+        Returns
+        -------
+        self : TabPFNRegressorWrapper
+        """
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict target gene expression.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+
+        Returns
+        -------
+        predictions : np.ndarray
+            Predicted expression of shape (n_samples, n_targets)
+        """
+        pred_dict = self.model.predict(X)
+        # Convert dict to array: column_stack preserves order of target_genes
+        return np.column_stack([pred_dict[t] for t in self.target_genes])
+
+
+class GENIE3RegressorWrapper:
+    """Wrapper for GENIE3 with fit/predict interface for expression evaluation.
+
+    Uses Random Forest regression to predict each target gene from TFs.
+    """
+
+    def __init__(self, n_estimators: int = 100, random_state: int = 42):
+        self.n_estimators = n_estimators
+        self.random_state = random_state
+        self.models_: dict[int, Any] = {}
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "GENIE3RegressorWrapper":
+        """Train one RandomForest per target gene.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+        y : np.ndarray
+            Target expression matrix (n_samples, n_targets)
+
+        Returns
+        -------
+        self : GENIE3RegressorWrapper
+        """
+        from sklearn.ensemble import RandomForestRegressor
+
+        n_targets = y.shape[1]
+        for target_idx in range(n_targets):
+            rf = RandomForestRegressor(
+                n_estimators=self.n_estimators,
+                max_features="sqrt",
+                random_state=self.random_state,
+                n_jobs=-1,
+            )
+            rf.fit(X, y[:, target_idx])
+            self.models_[target_idx] = rf
+
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict expression for all targets.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+
+        Returns
+        -------
+        predictions : np.ndarray
+            Predicted expression of shape (n_samples, n_targets)
+        """
+        n_samples = X.shape[0]
+        n_targets = len(self.models_)
+        predictions = np.zeros((n_samples, n_targets))
+
+        for target_idx, model in self.models_.items():
+            predictions[:, target_idx] = model.predict(X)
+
+        return predictions
+
+
+class GRNBoost2RegressorWrapper:
+    """Wrapper for GRNBoost2 with fit/predict interface for expression evaluation.
+
+    Uses Gradient Boosting regression to predict each target gene from TFs.
+    """
+
+    def __init__(self, n_estimators: int = 100, random_state: int = 42):
+        self.n_estimators = n_estimators
+        self.random_state = random_state
+        self.models_: dict[int, Any] = {}
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "GRNBoost2RegressorWrapper":
+        """Train one GradientBoostingRegressor per target gene.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+        y : np.ndarray
+            Target expression matrix (n_samples, n_targets)
+
+        Returns
+        -------
+        self : GRNBoost2RegressorWrapper
+        """
+        from sklearn.ensemble import GradientBoostingRegressor
+
+        n_targets = y.shape[1]
+        for target_idx in range(n_targets):
+            gb = GradientBoostingRegressor(
+                n_estimators=self.n_estimators,
+                learning_rate=0.1,
+                max_depth=3,
+                random_state=self.random_state,
+            )
+            gb.fit(X, y[:, target_idx])
+            self.models_[target_idx] = gb
+
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict expression for all targets.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+
+        Returns
+        -------
+        predictions : np.ndarray
+            Predicted expression of shape (n_samples, n_targets)
+        """
+        n_samples = X.shape[0]
+        n_targets = len(self.models_)
+        predictions = np.zeros((n_samples, n_targets))
+
+        for target_idx, model in self.models_.items():
+            predictions[:, target_idx] = model.predict(X)
+
+        return predictions
+
+
+class CorrelationPredictorWrapper:
+    """Linear regression wrapper for correlation-based expression prediction.
+
+    Uses linear regression to predict target genes from TFs.
+    The correlation method itself is used for edge scoring, but for
+    expression prediction we need an actual predictive model.
+    """
+
+    def __init__(self):
+        self.coef_: np.ndarray | None = None  # Shape: (n_TFs, n_targets)
+        self.intercept_: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "CorrelationPredictorWrapper":
+        """Fit linear regression: y = X @ coef_ + intercept_.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+        y : np.ndarray
+            Target expression matrix (n_samples, n_targets)
+
+        Returns
+        -------
+        self : CorrelationPredictorWrapper
+        """
+        from sklearn.linear_model import LinearRegression
+
+        lr = LinearRegression()
+        lr.fit(X, y)
+        self.coef_ = lr.coef_.T  # Transpose to (n_TFs, n_targets)
+        self.intercept_ = lr.intercept_
+
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict expression: y_pred = X @ coef_ + intercept_.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+
+        Returns
+        -------
+        predictions : np.ndarray
+            Predicted expression of shape (n_samples, n_targets)
+        """
+        if self.coef_ is None or self.intercept_ is None:
+            raise ValueError("Model must be fitted before prediction")
+        return X @ self.coef_ + self.intercept_
+
+
+class MutualInfoPredictorWrapper:
+    """Linear regression wrapper for MI-based expression prediction.
+
+    Uses linear regression to predict target genes from TFs.
+    The mutual information method is used for edge scoring, but for
+    expression prediction we need an actual predictive model.
+    """
+
+    def __init__(self):
+        self.coef_: np.ndarray | None = None
+        self.intercept_: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "MutualInfoPredictorWrapper":
+        """Fit linear regression.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+        y : np.ndarray
+            Target expression matrix (n_samples, n_targets)
+
+        Returns
+        -------
+        self : MutualInfoPredictorWrapper
+        """
+        from sklearn.linear_model import LinearRegression
+
+        lr = LinearRegression()
+        lr.fit(X, y)
+        self.coef_ = lr.coef_.T
+        self.intercept_ = lr.intercept_
+
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict expression.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            TF expression matrix (n_samples, n_TFs)
+
+        Returns
+        -------
+        predictions : np.ndarray
+            Predicted expression of shape (n_samples, n_targets)
+        """
+        if self.coef_ is None or self.intercept_ is None:
+            raise ValueError("Model must be fitted before prediction")
+        return X @ self.coef_ + self.intercept_
+
+
+# ============================================================================
+# GRN Analysis Functions (Edge Prediction)
+# ============================================================================
 
 
 def run_tabpfnn_analysis(
@@ -81,7 +383,7 @@ def run_tabpfnn_analysis(
         tf_names=tf_names,
         target_genes=target_genes,
         n_estimators=n_estimators,
-        device="cpu",  # Use "cuda" if available
+        device="auto",  # Automatically use CUDA if available
         attention_aggregation="mean",
         edge_score_strategy=edge_score_strategy,
     )
@@ -175,7 +477,7 @@ def run_tabpfnn_analysis_with_y(
         tf_names=tf_names,
         target_genes=target_genes,
         n_estimators=n_estimators,
-        device="cpu",
+        device="auto",  # Automatically use CUDA if available
         attention_aggregation="mean",
         edge_score_strategy=edge_score_strategy,
     )
@@ -215,6 +517,110 @@ def run_tabpfnn_analysis_with_y(
         "strategy": edge_score_strategy,
     }
 
+
+def evaluate_expression_accuracy(
+    X: np.ndarray,
+    y: np.ndarray,
+    tf_names: list[str],
+    target_genes: list[str],
+    model_class: type,
+    model_kwargs: dict,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    method_name: str = "Unknown",
+) -> dict[str, Any]:
+    """Evaluate expression prediction accuracy with train/test split.
+
+    Evaluates how accurately a method predicts target gene expression values
+    from input TF expression. Uses an 80/20 train/test split.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        TF expression matrix (samples x TFs)
+    y : np.ndarray
+        Target expression matrix (samples x targets)
+    tf_names : list[str]
+        Transcription factor names
+    target_genes : list[str]
+        Target gene names
+    model_class : type
+        Model class with .fit() and .predict() methods
+    model_kwargs : dict
+        Keyword arguments for model initialization
+    test_size : float
+        Fraction of data to use for testing (default 0.2)
+    random_state : int
+        Random seed for reproducibility
+    method_name : str
+        Name of the method for reporting
+
+    Returns
+    -------
+    results : dict
+        Dictionary with metrics and metadata:
+        - 'method': Method name
+        - 'metrics': Dict with mean/std of MSE, RMSE, MAE, R², Pearson r
+        - 'evaluation_time': Time taken for evaluation
+        - 'n_train': Number of training samples
+        - 'n_test': Number of test samples
+    """
+    from sklearn.model_selection import train_test_split
+
+    print(f"\n  Evaluating expression prediction: {method_name}")
+    print(f"    Train/test split: {100*(1-test_size):.0f}/{100*test_size:.0f}")
+
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state
+    )
+
+    print(f"    Training samples: {X_train.shape[0]}")
+    print(f"    Test samples: {X_test.shape[0]}")
+
+    # Handle TabPFN wrapper which needs tf_names and target_genes
+    if "TabPFNRegressorWrapper" in str(model_class):
+        # Extract TabPFN-specific kwargs
+        n_estimators = model_kwargs.pop("n_estimators", 1)
+        edge_score_strategy = model_kwargs.pop("edge_score_strategy", "self_attention")
+        model = model_class(
+            tf_names=tf_names,
+            target_genes=target_genes,
+            n_estimators=n_estimators,
+            edge_score_strategy=edge_score_strategy,
+        )
+    else:
+        model = model_class(**model_kwargs)
+
+    # Train and evaluate
+    start_time = time.time()
+    metrics = evaluate_expression_prediction(
+        model, X_train, y_train, X_test, y_test, target_genes
+    )
+    eval_time = time.time() - start_time
+
+    # Add metadata
+    metrics["evaluation_time"] = eval_time
+    metrics["n_train"] = X_train.shape[0]
+    metrics["n_test"] = X_test.shape[0]
+
+    # Print results
+    print(f"    Results:")
+    print(f"      MSE:  {metrics['mean_mse']:.4f} (+/- {metrics['std_mse']:.4f})")
+    print(f"      RMSE: {metrics['mean_rmse']:.4f} (+/- {metrics['std_rmse']:.4f})")
+    print(f"      MAE:  {metrics['mean_mae']:.4f} (+/- {metrics['std_mae']:.4f})")
+    print(f"      R²:   {metrics['mean_r2']:.4f} (+/- {metrics['std_r2']:.4f})")
+    print(f"      Pearson r: {metrics['mean_pearson_r']:.4f} (+/- {metrics['std_pearson_r']:.4f})")
+
+    return {
+        "method": method_name,
+        "metrics": metrics,
+    }
+
+
+# ============================================================================
+# GRN Analysis Functions (Edge Prediction)
+# ============================================================================
 
 def run_correlation_baseline(
     expression: np.ndarray,
@@ -736,15 +1142,18 @@ def run_mutual_information_baseline(
 def generate_comparison_report(
     results: list[dict[str, Any]],
     output_dir: Path,
+    expression_results: list[dict[str, Any]] | None = None,
 ) -> None:
     """Generate comparison report and visualizations.
 
     Parameters
     ----------
     results : list of dict
-        All results from different methods
+        All edge prediction results from different methods
     output_dir : Path
         Directory to save outputs
+    expression_results : list of dict, optional
+        Expression prediction accuracy results
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -755,6 +1164,15 @@ def generate_comparison_report(
         if dataset not in datasets:
             datasets[dataset] = []
         datasets[dataset].append(r)
+
+    # Group expression results by dataset
+    expression_datasets = {}
+    if expression_results:
+        for r in expression_results:
+            dataset = r["dataset"]
+            if dataset not in expression_datasets:
+                expression_datasets[dataset] = []
+            expression_datasets[dataset].append(r)
 
     # Generate report
     report_lines = []
@@ -859,6 +1277,109 @@ def generate_comparison_report(
             plt.savefig(output_dir / f"{dataset_name}_comparison.png", dpi=150)
             plt.close()
 
+    # Add expression accuracy section to report
+    if expression_datasets:
+        report_lines.append("\n" + "=" * 80)
+        report_lines.append("EXPRESSION PREDICTION ACCURACY")
+        report_lines.append("=" * 80)
+        report_lines.append("")
+
+        for dataset_name, dataset_results in expression_datasets.items():
+            report_lines.append(f"\n{'='*80}")
+            report_lines.append(f"Dataset: {dataset_name}")
+            report_lines.append(f"{'='*80}")
+            report_lines.append("")
+
+            # Create table header
+            report_lines.append(f"{'Method':<25} {'R²':<10} {'Pearson r':<12} {'RMSE':<10}")
+            report_lines.append("-" * 80)
+
+            # Sort by R²
+            sorted_results = sorted(
+                dataset_results,
+                key=lambda x: x["metrics"]["mean_r2"],
+                reverse=True
+            )
+
+            for r in sorted_results:
+                method = r["method"]
+                r2 = r["metrics"]["mean_r2"]
+                pearson = r["metrics"]["mean_pearson_r"]
+                rmse = r["metrics"]["mean_rmse"]
+                report_lines.append(f"{method:<25} {r2:<10.4f} {pearson:<12.4f} {rmse:<10.4f}")
+
+            report_lines.append("")
+
+        # Create expression accuracy comparison visualization
+        if expression_datasets:
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+            # Collect all unique methods across datasets
+            all_methods = sorted(set(
+                r["method"] for dataset_results in expression_datasets.values()
+                for r in dataset_results
+            ))
+
+            # Create color mapping for consistent colors across plots
+            colors = plt.cm.tab10(np.linspace(0, 1, len(all_methods)))
+            method_colors = {m: c for m, c in zip(all_methods, colors)}
+
+            # Plot 1: R² comparison
+            for dataset_name, dataset_results in expression_datasets.items():
+                r2_values = {r["method"]: r["metrics"]["mean_r2"] for r in dataset_results}
+                x_pos = list(expression_datasets.keys()).index(dataset_name)
+                width = 0.8 / len(all_methods)
+                for i, method in enumerate(all_methods):
+                    if method in r2_values:
+                        axes[0].bar(x_pos + i * width, r2_values[method], width,
+                                  label=method if dataset_name == list(expression_datasets.keys())[0] else "",
+                                  color=method_colors[method])
+
+            axes[0].set_ylabel("R²")
+            axes[0].set_title("Expression Prediction: R² Score")
+            axes[0].set_xticks(np.arange(len(expression_datasets)))
+            axes[0].set_xticklabels(expression_datasets.keys(), rotation=15, ha="right")
+            axes[0].legend(fontsize=8, ncol=2)
+            axes[0].axhline(y=0, color='k', linestyle='--', linewidth=0.5)
+            axes[0].grid(True, alpha=0.3)
+
+            # Plot 2: Pearson correlation
+            for dataset_name, dataset_results in expression_datasets.items():
+                pearson_values = {r["method"]: r["metrics"]["mean_pearson_r"] for r in dataset_results}
+                x_pos = list(expression_datasets.keys()).index(dataset_name)
+                for i, method in enumerate(all_methods):
+                    if method in pearson_values:
+                        axes[1].bar(x_pos + i * width, pearson_values[method], width,
+                                  color=method_colors[method])
+
+            axes[1].set_ylabel("Pearson r")
+            axes[1].set_title("Expression Prediction: Pearson Correlation")
+            axes[1].set_xticks(np.arange(len(expression_datasets)))
+            axes[1].set_xticklabels(expression_datasets.keys(), rotation=15, ha="right")
+            axes[1].axhline(y=0, color='k', linestyle='--', linewidth=0.5)
+            axes[1].grid(True, alpha=0.3)
+
+            # Plot 3: RMSE
+            for dataset_name, dataset_results in expression_datasets.items():
+                rmse_values = {r["method"]: r["metrics"]["mean_rmse"] for r in dataset_results}
+                x_pos = list(expression_datasets.keys()).index(dataset_name)
+                for i, method in enumerate(all_methods):
+                    if method in rmse_values:
+                        axes[2].bar(x_pos + i * width, rmse_values[method], width,
+                                  color=method_colors[method])
+
+            axes[2].set_ylabel("RMSE")
+            axes[2].set_title("Expression Prediction: RMSE")
+            axes[2].set_xticks(np.arange(len(expression_datasets)))
+            axes[2].set_xticklabels(expression_datasets.keys(), rotation=15, ha="right")
+            axes[2].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(output_dir / "expression_accuracy_comparison.png", dpi=150)
+            plt.close()
+
     # Save report
     report_path = output_dir / "GRN_Performance_Report.txt"
     with open(report_path, "w") as f:
@@ -882,12 +1403,26 @@ def generate_comparison_report(
                 if "@" in k:
                     summary[dataset_name][r["method"]][k] = v
 
+    # Add expression accuracy to JSON summary
+    if expression_datasets:
+        summary["expression_accuracy"] = {}
+        for dataset_name, dataset_results in expression_datasets.items():
+            summary["expression_accuracy"][dataset_name] = {}
+            for r in dataset_results:
+                summary["expression_accuracy"][dataset_name][r["method"]] = {
+                    "r2": r["metrics"]["mean_r2"],
+                    "pearson_r": r["metrics"]["mean_pearson_r"],
+                    "rmse": r["metrics"]["mean_rmse"],
+                    "mae": r["metrics"]["mean_mae"],
+                }
+
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print(f"\n{'='*80}")
     print(f"Report saved to: {report_path}")
     print(f"Summary saved to: {output_dir / 'summary.json'}")
+    print(f"Expression accuracy plot saved to: {output_dir / 'expression_accuracy_comparison.png'}")
     print(f"{'='*80}")
 
 
@@ -907,6 +1442,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = []
+    all_expression_results = []  # Collect all expression accuracy results
 
     # Define TabPFN edge score strategies to test
     tabpfn_strategies = [
@@ -979,6 +1515,65 @@ def main() -> None:
         if result_grnboost2:
             all_results.append(result_grnboost2)
 
+    # Expression Prediction Accuracy Evaluation (DREAM4-10)
+    print("\n" + "="*80)
+    print("EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-10)")
+    print("="*80)
+
+    # TabPFN variants (using network 1 data)
+    for strategy in tabpfn_strategies:
+        result = evaluate_expression_accuracy(
+            X, y, tf_names, target_genes,
+            model_class=TabPFNRegressorWrapper,
+            model_kwargs={
+                "n_estimators": 1,
+                "edge_score_strategy": strategy
+            },
+            method_name=f"TabPFN ({strategy})"
+        )
+        result["dataset"] = "DREAM4_10_Expr"
+        all_expression_results.append(result)
+
+    # GENIE3
+    result_genie3_expr = evaluate_expression_accuracy(
+        X, y, tf_names, target_genes,
+        model_class=GENIE3RegressorWrapper,
+        model_kwargs={"n_estimators": 50},  # Reduced for speed
+        method_name="GENIE3"
+    )
+    result_genie3_expr["dataset"] = "DREAM4_10_Expr"
+    all_expression_results.append(result_genie3_expr)
+
+    # GRNBoost2
+    result_grnboost2_expr = evaluate_expression_accuracy(
+        X, y, tf_names, target_genes,
+        model_class=GRNBoost2RegressorWrapper,
+        model_kwargs={"n_estimators": 50},  # Reduced for speed
+        method_name="GRNBoost2"
+    )
+    result_grnboost2_expr["dataset"] = "DREAM4_10_Expr"
+    all_expression_results.append(result_grnboost2_expr)
+
+    # Correlation (Linear Regression)
+    result_corr_expr = evaluate_expression_accuracy(
+        X, y, tf_names, target_genes,
+        model_class=CorrelationPredictorWrapper,
+        model_kwargs={},
+        method_name="Correlation (LR)"
+    )
+    result_corr_expr["dataset"] = "DREAM4_10_Expr"
+    all_expression_results.append(result_corr_expr)
+
+    # Mutual Information (Linear Regression)
+    result_mi_expr = evaluate_expression_accuracy(
+        X, y, tf_names, target_genes,
+        model_class=MutualInfoPredictorWrapper,
+        model_kwargs={},
+        method_name="Mutual Info (LR)"
+    )
+    result_mi_expr["dataset"] = "DREAM4_10_Expr"
+    all_expression_results.append(result_mi_expr)
+
     # ============================================================================
     # DREAM4 Analysis (100 genes - larger test)
     # ============================================================================
@@ -1029,6 +1624,45 @@ def main() -> None:
     )
     if result_grnboost2:
         all_results.append(result_grnboost2)
+
+    # Expression Prediction Accuracy Evaluation (DREAM4-100)
+    print("\n" + "="*80)
+    print("EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-100)")
+    print("="*80)
+
+    # TabPFN variants (select strategies for speed)
+    for strategy in ["self_attention", "combined_best"]:
+        result = evaluate_expression_accuracy(
+            X, y, tf_names, target_genes,
+            model_class=TabPFNRegressorWrapper,
+            model_kwargs={
+                "n_estimators": 1,
+                "edge_score_strategy": strategy
+            },
+            method_name=f"TabPFN ({strategy})"
+        )
+        result["dataset"] = "DREAM4_100_Expr"
+        all_expression_results.append(result)
+
+    # GENIE3
+    result_genie3_expr = evaluate_expression_accuracy(
+        X, y, tf_names, target_genes,
+        model_class=GENIE3RegressorWrapper,
+        model_kwargs={"n_estimators": 50},
+        method_name="GENIE3"
+    )
+    result_genie3_expr["dataset"] = "DREAM4_100_Expr"
+    all_expression_results.append(result_genie3_expr)
+
+    # Correlation (Linear Regression)
+    result_corr_expr = evaluate_expression_accuracy(
+        X, y, tf_names, target_genes,
+        model_class=CorrelationPredictorWrapper,
+        model_kwargs={},
+        method_name="Correlation (LR)"
+    )
+    result_corr_expr["dataset"] = "DREAM4_100_Expr"
+    all_expression_results.append(result_corr_expr)
 
     # ============================================================================
     # DREAM5 E. coli Analysis (real data)
@@ -1136,6 +1770,45 @@ def main() -> None:
         )
         if result_grnboost2:
             all_results.append(result_grnboost2)
+
+        # Expression Prediction Accuracy Evaluation (DREAM5)
+        print("\n" + "="*80)
+        print("EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM5 E. coli)")
+        print("="*80)
+
+        # TabPFN variants (select strategies for speed)
+        for strategy in ["self_attention", "combined_best"]:
+            result = evaluate_expression_accuracy(
+                X, y_subset, tf_names_filtered, target_genes,
+                model_class=TabPFNRegressorWrapper,
+                model_kwargs={
+                    "n_estimators": 1,
+                    "edge_score_strategy": strategy
+                },
+                method_name=f"TabPFN ({strategy})"
+            )
+            result["dataset"] = "DREAM5_Ecoli_Expr"
+            all_expression_results.append(result)
+
+        # GENIE3
+        result_genie3_expr = evaluate_expression_accuracy(
+            X, y_subset, tf_names_filtered, target_genes,
+            model_class=GENIE3RegressorWrapper,
+            model_kwargs={"n_estimators": 50},
+            method_name="GENIE3"
+        )
+        result_genie3_expr["dataset"] = "DREAM5_Ecoli_Expr"
+        all_expression_results.append(result_genie3_expr)
+
+        # Correlation (Linear Regression)
+        result_corr_expr = evaluate_expression_accuracy(
+            X, y_subset, tf_names_filtered, target_genes,
+            model_class=CorrelationPredictorWrapper,
+            model_kwargs={},
+            method_name="Correlation (LR)"
+        )
+        result_corr_expr["dataset"] = "DREAM5_Ecoli_Expr"
+        all_expression_results.append(result_corr_expr)
     except Exception as e:
         import traceback
         print(f"DREAM5 E. coli analysis skipped: {e}")
@@ -1148,7 +1821,7 @@ def main() -> None:
     print("GENERATING FINAL REPORT")
     print("="*80)
 
-    generate_comparison_report(all_results, output_dir)
+    generate_comparison_report(all_results, output_dir, all_expression_results)
 
     print("\n" + "="*80)
     print("ANALYSIS COMPLETE")

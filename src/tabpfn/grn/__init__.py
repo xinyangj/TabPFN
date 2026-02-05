@@ -13,9 +13,11 @@ from tabpfn.grn.datasets import DREAMChallengeLoader
 from tabpfn.grn.evaluation import (
     compute_aupr,
     compute_auroc,
+    compute_expression_metrics,
     compute_f1_at_k,
     compute_precision_at_k,
     compute_recall_at_k,
+    evaluate_expression_prediction,
     evaluate_grn,
 )
 from tabpfn.grn.grn_regressor import TabPFNGRNRegressor
@@ -35,9 +37,11 @@ __all__ = [
     "TabPFNGRNRegressor",
     "compute_auroc",
     "compute_aupr",
+    "compute_expression_metrics",
     "compute_precision_at_k",
     "compute_recall_at_k",
     "compute_f1_at_k",
+    "evaluate_expression_prediction",
     "evaluate_grn",
     "GRNNetworkVisualizer",
     "AttentionHeatmapVisualizer",
