@@ -8,7 +8,11 @@ Note: This approach uses TabPFN as a frozen foundation model with in-context lea
 No fine-tuning or weight updates are performed.
 """
 
-from tabpfn.grn.attention_extractor import AttentionExtractor, EdgeScoreComputer
+from tabpfn.grn.attention_extractor import (
+    AttentionExtractor,
+    EdgeScoreComputer,
+    GradientAttentionExtractor,
+)
 from tabpfn.grn.datasets import DREAMChallengeLoader
 from tabpfn.grn.evaluation import (
     compute_aupr,
@@ -32,6 +36,7 @@ from tabpfn.grn.visualization import (
 __all__ = [
     "AttentionExtractor",
     "EdgeScoreComputer",
+    "GradientAttentionExtractor",
     "DREAMChallengeLoader",
     "GRNPreprocessor",
     "TabPFNGRNRegressor",
