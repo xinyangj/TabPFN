@@ -719,24 +719,36 @@ class GradientAttentionExtractor(AttentionExtractor):
 
         head_weights: dict[str, dict[str, torch.Tensor]] = {}
 
+        print(f"\n  [GRADIENT_WEIGHTS] Computing gradient-based head weights...")
+        print(f"  [GRADIENT_WEIGHTS] X shape: {X.shape}, y_target shape: {y_target.shape}")
+        print(f"  [GRADIENT_WEIGHTS] Normalization: {normalization}")
+
         # TabPFNRegressor wraps one or more PerFeatureTransformer models
         # For GRN inference, we typically use n_estimators=1 for efficiency
         if hasattr(model, "models_") and model.models_:
+            print(f"  [GRADIENT_WEIGHTS] Found {len(model.models_)} model(s) in ensemble")
+
             # Process the first (and typically only) model in the ensemble
             for model_idx, model_arch in enumerate(model.models_):
                 if not hasattr(model_arch, "transformer_encoder"):
+                    print(f"  [GRADIENT_WEIGHTS] Model {model_idx} has no transformer_encoder - skipping")
                     continue
 
                 encoder = model_arch.transformer_encoder
+                print(f"  [GRADIENT_WEIGHTS] Model {model_idx}: {len(encoder.layers)} layers")
 
                 # Compute gradients using the model's internal forward pass
                 # This handles TabPFN's in-context learning where X and y are concatenated
+                print(f"  [GRADIENT_WEIGHTS] Computing attention gradients...")
                 gradients = self._compute_attention_gradients(
                     model_arch, X, y_target, encoder
                 )
 
                 # If gradient computation succeeded, compute head weights
                 if gradients:
+                    print(f"  [GRADIENT_WEIGHTS] ✓ Gradient computation succeeded!")
+                    print(f"  [GRADIENT_WEIGHTS] Computing head weights from gradients...")
+
                     for layer_idx in range(len(encoder.layers)):
                         layer_key = f"layer_{layer_idx}"
 
@@ -763,14 +775,17 @@ class GradientAttentionExtractor(AttentionExtractor):
                                     gradients[grad_key], nheads, normalization
                                 )
                                 head_weights[layer_key][attn_type] = weights
+                                print(f"  [GRADIENT_WEIGHTS]   {layer_key}_{attn_type}: {weights.tolist()}")
                             else:
                                 # No gradient for this layer/type - use uniform weights
                                 head_weights[layer_key][attn_type] = torch.ones(
                                     nheads, device=device
                                 ) / nheads
+                                print(f"  [GRADIENT_WEIGHTS]   {layer_key}_{attn_type}: uniform (no gradient)")
                 else:
                     # Gradient computation failed - use attention-based weights
                     import warnings
+                    print(f"  [GRADIENT_WEIGHTS] ✗ Gradient computation failed - using attention-based fallback")
                     warnings.warn(
                         "Gradient computation failed. Using attention magnitude "
                         "as proxy for head importance."
@@ -785,9 +800,11 @@ class GradientAttentionExtractor(AttentionExtractor):
         # Fallback: return uniform weights if no model found
         if not head_weights:
             import warnings
+            print(f"  [GRADIENT_WEIGHTS] ✗ No head weights computed - using uniform weights")
             warnings.warn("Could not compute head weights. Using uniform weights.")
             return self._compute_uniform_head_weights(attention_weights, device)
 
+        print(f"  [GRADIENT_WEIGHTS] ✓ Successfully computed gradient-based head weights")
         return head_weights
 
     def _compute_attention_based_head_weights(
@@ -812,6 +829,7 @@ class GradientAttentionExtractor(AttentionExtractor):
         head_weights : dict
             Head importance weights based on attention magnitude
         """
+        print(f"  [ATTENTION_FALLBACK] Computing attention-magnitude-based head weights...")
         head_weights = {}
 
         for layer_key, layer_data in attention_weights.items():
@@ -836,7 +854,9 @@ class GradientAttentionExtractor(AttentionExtractor):
                 head_weights[layer_key][attn_type] = (
                     head_magnitude / (head_magnitude.sum() + 1e-8)
                 )
+                print(f"  [ATTENTION_FALLBACK]   {layer_key}_{attn_type}: {head_weights[layer_key][attn_type].tolist()}")
 
+        print(f"  [ATTENTION_FALLBACK] ✓ Computed attention-magnitude-based weights")
         return head_weights
 
     def _compute_uniform_head_weights(
@@ -858,6 +878,7 @@ class GradientAttentionExtractor(AttentionExtractor):
         head_weights : dict
             Uniform weights for all heads
         """
+        print(f"  [UNIFORM_FALLBACK] Computing uniform head weights...")
         head_weights = {}
 
         for layer_key, layer_data in attention_weights.items():
@@ -869,7 +890,9 @@ class GradientAttentionExtractor(AttentionExtractor):
                 head_weights[layer_key][attn_type] = torch.ones(
                     nheads, device=device
                 ) / nheads
+                print(f"  [UNIFORM_FALLBACK]   {layer_key}_{attn_type}: uniform (1/{nheads} = {1.0/nheads:.4f})")
 
+        print(f"  [UNIFORM_FALLBACK] ✓ Computed uniform weights")
         return head_weights
 
     def _compute_attention_gradients(
@@ -948,96 +971,195 @@ class GradientAttentionExtractor(AttentionExtractor):
         try:
             # Use TabPFN's internal forward mechanism for gradient computation
             # TabPFNRegressor wraps PerFeatureTransformer which needs proper context
-            if hasattr(model, "forward") and hasattr(model, "config_"):
-                # Get model configuration for proper forward pass
-                config = model.config_
+            print(f"    [GRADIENT] Starting gradient computation for target prediction...")
+            print(f"    [GRADIENT] X shape: {X.shape}, y_target shape: {y_target.shape}")
+            print(f"    [GRADIENT] Model type: {type(model).__name__}")
 
-                # Convert X to list format if needed (TabPFN's internal format)
-                if isinstance(X, torch.Tensor):
-                    X_list = [X]  # TabPFN expects list of tensors
-                else:
-                    X_list = X
+            # Check if this is a TabPFN PerFeatureTransformer
+            is_tabpfn_model = (
+                hasattr(model, "forward") and
+                hasattr(model, "transformer_encoder") and
+                hasattr(model, "encoder")
+            )
 
-                # Prepare y_target in the format TabPFN expects
-                # TabPFN concatenates X and y as: embedded_input = cat((embedded_x, embedded_y), dim=2)
-                # For gradient computation, we need to call forward with both X and y
+            print(f"    [GRADIENT] Is TabPFN PerFeatureTransformer: {is_tabpfn_model}")
+
+            if is_tabpfn_model:
+                print(f"    [GRADIENT] Using TabPFN PerFeatureTransformer forward pass...")
+
+                # TabPFN expects X shape: (seq_len, batch_size, num_features)
+                # Where seq_len includes both training and test samples
+                # For gradient computation, we use all samples as "training" context
+                seq_len, n_features = X.shape
+                batch_size = 1
+
+                # Reshape X to (seq_len, batch_size, n_features)
+                X_reshaped = X.unsqueeze(1)  # (seq_len, 1, n_features)
+
+                # Prepare y with shape (seq_len, batch_size, 1) for training
+                # TabPFN uses y as the target values for in-context learning
+                y_reshaped = y_target.unsqueeze(1).unsqueeze(2)  # (seq_len, 1, 1)
+
+                print(f"    [GRADIENT] Reshaped X to: {X_reshaped.shape}")
+                print(f"    [GRADIENT] Reshaped y to: {y_reshaped.shape}")
+
+                # Use dictionary format (more explicit for TabPFN)
+                X_input = {"main": X_reshaped}
+                y_input = {"main": y_reshaped}
+
+                print(f"    [GRADIENT] Attempting TabPFN forward pass...")
+
+                # Try calling TabPFN's forward method
                 try:
-                    # Try the full forward pass with both X and y
-                    # This is the proper way TabPFN processes in-context learning
+                    # TabPFN forward signature: forward(x, y, ...)
+                    # We pass both X and y for gradient computation
+                    print(f"    [GRADIENT] Calling model.forward(x_dict, y_dict, ...)...")
                     y_pred = model.forward(
-                        X_list,
-                        y=y_target.unsqueeze(0) if y_target.dim() == 1 else y_target,
-                        only_return_standard_out=True
+                        x=X_input,
+                        y=y_input,
+                        only_return_standard_out=True,
+                        force_recompute_layer=False,  # Allow gradient computation
                     )
 
-                    # Handle prediction output
+                    print(f"    [GRADIENT] Forward pass completed!")
+                    print(f"    [GRADIENT] Prediction type: {type(y_pred)}")
+                    print(f"    [GRADIENT] Prediction details: ", end="")
+
                     if isinstance(y_pred, (list, tuple)):
-                        # TabPFN returns (predictions, logits, borders)
-                        y_pred_tensor = y_pred[0] if y_pred[0] is not None else torch.tensor(0.0)
+                        print(f"list/tuple with {len(y_pred)} elements")
+                        if y_pred:
+                            print(f"                  First element type: {type(y_pred[0])}")
+                            if isinstance(y_pred[0], torch.Tensor):
+                                print(f"                  First element shape: {y_pred[0].shape}")
                     elif isinstance(y_pred, dict):
-                        # Extract predictions from dict
-                        y_pred_tensor = next(iter(y_pred.values())) if y_pred else torch.tensor(0.0)
+                        print(f"dict with {len(y_pred)} keys: {list(y_pred.keys())}")
+                        # Extract the "standard" output which contains predictions
+                        if "standard" in y_pred:
+                            y_pred_tensor = y_pred["standard"]
+                            print(f"                  Standard output shape: {y_pred_tensor.shape}")
+                        else:
+                            # Use first available key
+                            y_pred_tensor = next(iter(y_pred.values()))
+                            print(f"                  Using first value: {y_pred_tensor.shape}")
                     elif isinstance(y_pred, torch.Tensor):
                         y_pred_tensor = y_pred
+                        print(f"tensor with shape {y_pred.shape}")
                     else:
                         y_pred_tensor = torch.tensor(y_pred, device=X.device)
+                        print(f"converted to tensor")
+
+                    print(f"    [GRADIENT] Final prediction tensor shape: {y_pred_tensor.shape}")
+                    print(f"    [GRADIENT] Prediction requires_grad: {y_pred_tensor.requires_grad}")
+
+                    # Check if prediction is valid (non-empty)
+                    if y_pred_tensor.numel() == 0 or (y_pred_tensor.dim() >= 1 and y_pred_tensor.shape[0] == 0):
+                        # Empty prediction - can't compute gradients
+                        import warnings
+                        print(f"    [GRADIENT] ✗ Empty prediction (shape[0] == 0)")
+                        warnings.warn(
+                            "TabPFN produced empty prediction - cannot compute gradients. "
+                            "Using attention-based head importance."
+                        )
+                        # Return empty dict to signal failure (will use attention-based fallback)
+                        return {}
 
                     # Ensure gradient flow
                     if not y_pred_tensor.requires_grad:
                         # If predictions don't require grad, compute gradients differently
                         # Use the attention weights directly to compute importance
                         import warnings
+                        print(f"    [GRADIENT] ✗ Prediction detached from computation graph")
                         warnings.warn(
                             "TabPFN predictions are detached from computation graph. "
                             "Using attention-based head importance instead of gradients."
                         )
-                        return self._compute_attention_based_weights(encoder)
+                        # Return empty dict to signal failure
+                        return {}
 
-                except (TypeError, AttributeError, KeyError) as e:
+                    # Compute loss for gradient computation
+                    # For regression, use MSE between prediction and target
+                    # This gradient points in direction of improving target prediction
+                    print(f"    [GRADIENT] Computing loss...")
+
+                    # Handle different prediction formats
+                    if y_pred_tensor.dim() == 3 and y_pred_tensor.shape[0] > 0:
+                        # Prediction shape: (n_pred, batch, n_outputs)
+                        # Target shape: (n_samples,)
+                        # We need to match the sizes for loss computation
+
+                        # TabPFN outputs predictions for test samples (after training samples)
+                        # The number of predictions might differ from number of targets
+                        n_preds = y_pred_tensor.shape[0]
+                        n_targets = y_pred_tensor.shape[2] if y_pred_tensor.shape[2] < y_target.numel() else y_target.numel()
+
+                        print(f"    [GRADIENT] n_preds: {n_preds}, n_targets: {n_targets}")
+
+                        # Use the first n_targets predictions and first n_targets targets
+                        if n_preds > 0:
+                            y_pred_used = y_pred_tensor[0, 0, :n_targets]  # (n_targets,)
+                            y_target_used = y_target[:n_targets]  # (n_targets,)
+
+                            print(f"    [GRADIENT] y_pred_used shape: {y_pred_used.shape}")
+                            print(f"    [GRADIENT] y_target_used shape: {y_target_used.shape}")
+
+                            loss = torch.nn.functional.mse_loss(y_pred_used, y_target_used)
+                        else:
+                            # No predictions available
+                            print(f"    [GRADIENT] ✗ No valid predictions available")
+                            # Return empty dict to signal failure
+                            return {}
+                    else:
+                        # Fallback for other prediction formats
+                        print(f"    [GRADIENT] Unexpected prediction format, using generic loss")
+                        loss = torch.nn.functional.mse_loss(
+                            y_pred_tensor.flatten()[:y_target.numel()],
+                            y_target.flatten()[:y_pred_tensor.numel()]
+                        )
+
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        import warnings
+                        print(f"    [GRADIENT] ✗ Loss is NaN/Inf - cannot compute gradients")
+                        warnings.warn(
+                            "Loss computation produced NaN/Inf - cannot compute gradients. "
+                            "Using attention-based head importance."
+                        )
+                        # Return empty dict to signal failure
+                        return {}
+
+                    print(f"    [GRADIENT] Computed loss: {loss.item():.6f}")
+
+                    # Backward pass to compute gradients w.r.t. attention outputs
+                    print(f"    [GRADIENT] Computing backward pass...")
+                    loss.backward()
+                    print(f"    [GRADIENT] Backward pass completed")
+
+                except Exception as e:
+                    print(f"    [GRADIENT] TabPFN forward/backward pass failed: {e}")
+                    import traceback
+                    print(f"    [GRADIENT] Traceback: {traceback.format_exc()}")
+
                     # Forward pass failed - try alternative approach
                     import warnings
                     warnings.warn(
                         f"TabPFN forward pass failed for gradient computation: {e}. "
                         "Falling back to attention-based head importance."
                     )
-                    return self._compute_attention_based_weights(encoder)
-
-            elif hasattr(model, "predict"):
-                # Fallback: Use predict method (won't give gradients but provides baseline)
-                import warnings
-                warnings.warn(
-                    "Model has predict() but not internal forward(). "
-                    "Cannot compute gradients - using uniform weights."
-                )
-                return {}
-
+                    return self._compute_attention_based_head_weights(attention_weights, device)
             else:
+                # Not a TabPFN model - try generic approach
+                print(f"    [GRADIENT] Not a TabPFN model - trying generic approach...")
                 import warnings
                 warnings.warn(
                     "Model architecture not recognized for gradient computation. "
-                    "Using uniform head weights."
+                    "Using attention-based head importance."
                 )
-                return {}
-
-            # Compute loss for gradient computation
-            # For regression, use MSE between prediction and target
-            # This gradient points in direction of improving target prediction
-            if y_pred_tensor.numel() > 1:
-                # Multiple predictions - compute mean loss
-                loss = torch.nn.functional.mse_loss(
-                    y_pred_tensor.flatten(),
-                    y_target.flatten() if y_target.numel() > 1 else y_target
-                )
-            else:
-                # Single prediction - compute scalar loss
-                loss = torch.nn.functional.mse_loss(y_pred_tensor, y_target.mean())
-
-            # Backward pass to compute gradients w.r.t. attention outputs
-            loss.backward()
+                return self._compute_attention_based_head_weights(attention_weights, device)
 
         except Exception as e:
             import warnings
             import traceback
+            print(f"    [GRADIENT] ERROR: {e}")
+            print(f"    [GRADIENT] Traceback: {traceback.format_exc()}")
             warnings.warn(
                 f"Gradient computation failed: {e}\n"
                 f"Traceback: {traceback.format_exc()}\n"
@@ -1051,6 +1173,15 @@ class GradientAttentionExtractor(AttentionExtractor):
                     hook.remove()
                 except Exception:
                     pass  # Hook may already be removed or invalid
+
+        # Log gradient results
+        if gradients:
+            print(f"    [GRADIENT] ✓ Successfully computed gradients for {len(gradients)} layer(s):")
+            for key in sorted(gradients.keys()):
+                grad_shape = gradients[key].shape
+                print(f"      - {key}: shape {grad_shape}, mean {gradients[key].abs().mean().item():.6f}")
+        else:
+            print(f"    [GRADIENT] ✗ No gradients captured - will use fallback method")
 
         return gradients
 
