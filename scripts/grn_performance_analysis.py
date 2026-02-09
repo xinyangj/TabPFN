@@ -6,6 +6,7 @@ Generates a detailed performance report with metrics and visualizations.
 
 from __future__ import annotations
 
+import gc
 import json
 import tempfile
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from tabpfn.grn import (
     DREAMChallengeLoader,
@@ -24,6 +26,27 @@ from tabpfn.grn import (
     EdgeScoreVisualizer,
     create_evaluation_summary_plot,
 )
+
+
+def cleanup_gpu_memory() -> None:
+    """Clean up GPU memory to prevent OOM errors during batch processing.
+
+    This function:
+    1. Forces Python garbage collection
+    2. Clears PyTorch CUDA cache
+    3. Resets peak memory stats
+    """
+    # Force Python garbage collection
+    gc.collect()
+
+    # Clear PyTorch CUDA cache if available
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        # Optional: Print memory stats for debugging
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"    GPU Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
 
 
 # ============================================================================
@@ -414,12 +437,16 @@ def run_tabpfnn_analysis(
         if f"recall@{k}" in metrics:
             print(f"  Recall@{k}:     {metrics[f'recall@{k}']:.4f}")
 
+    # CRITICAL: Release model memory before returning
+    # Delete model and clear attention weights to free GPU memory
+    del grn_model
+    cleanup_gpu_memory()
+
     return {
         "dataset": dataset_name,
         "method": f"TabPFN ({strategy_label})",
         "metrics": metrics,
         "edge_scores": edge_scores,
-        "grn_model": grn_model,
         "strategy": edge_score_strategy,
     }
 
@@ -508,12 +535,16 @@ def run_tabpfnn_analysis_with_y(
         if f"recall@{k}" in metrics:
             print(f"  Recall@{k}:     {metrics[f'recall@{k}']:.4f}")
 
+    # CRITICAL: Release model memory before returning
+    # Delete model and clear attention weights to free GPU memory
+    del grn_model
+    cleanup_gpu_memory()
+
     return {
         "dataset": dataset_name,
         "method": f"TabPFN ({strategy_label})",
         "metrics": metrics,
         "edge_scores": edge_scores,
-        "grn_model": grn_model,
         "strategy": edge_score_strategy,
     }
 
@@ -1451,7 +1482,8 @@ def main() -> None:
         "target_to_tf",
         "combined",
         "combined_best",
-        "sequential_rollout",  # New: unified attention rollout
+        "sequential_rollout",  # Unified attention rollout
+        "gradient_rollout",    # NEW: Gradient-weighted attention rollout (GMAR-inspired)
     ]
 
     # ============================================================================
@@ -1485,6 +1517,8 @@ def main() -> None:
                 dataset_name, n_estimators=1, edge_score_strategy=strategy
             )
             all_results.append(result_tabpfn)
+            # Clean up GPU memory after each strategy
+            cleanup_gpu_memory()
 
         # Run correlation baseline
         result_corr = run_correlation_baseline(
@@ -1592,6 +1626,8 @@ def main() -> None:
             dataset_name, n_estimators=1, edge_score_strategy=strategy
         )
         all_results.append(result_tabpfn)
+        # Clean up GPU memory after each strategy
+        cleanup_gpu_memory()
 
     # Run correlation baseline
     result_corr = run_correlation_baseline(
@@ -1678,6 +1714,10 @@ def main() -> None:
     print("DREAM5 E. COLI ANALYSIS (real data)")
     print("="*80)
 
+    # Clean up GPU memory before starting DREAM5 (largest dataset)
+    print("Cleaning up GPU memory before DREAM5 analysis...")
+    cleanup_gpu_memory()
+
     try:
         import pandas as pd
 
@@ -1740,13 +1780,15 @@ def main() -> None:
 
         dataset_name = "DREAM5_Ecoli_subset"
 
-        # Run TabPFN with all 5 strategies
+        # Run TabPFN with all 7 strategies
         for strategy in tabpfn_strategies:
             result_tabpfn = run_tabpfnn_analysis_with_y(
                 X, y_subset, tf_names_filtered, target_genes, filtered_gold_standard,
                 dataset_name, n_estimators=1, edge_score_strategy=strategy
             )
             all_results.append(result_tabpfn)
+            # Clean up GPU memory after each strategy (critical for DREAM5)
+            cleanup_gpu_memory()
 
         # Run correlation baseline with filtered expression
         # Need to create expression matrix with only TFs + selected targets
@@ -1761,6 +1803,7 @@ def main() -> None:
             target_genes, dataset_name
         )
         all_results.append(result_corr)
+        cleanup_gpu_memory()
 
         # Run GENIE3 baseline
         result_genie3 = run_genie3_baseline(
@@ -1769,6 +1812,7 @@ def main() -> None:
         )
         if result_genie3:
             all_results.append(result_genie3)
+        cleanup_gpu_memory()
 
         # Run GRNBoost2 baseline
         result_grnboost2 = run_grnboost2_baseline(
@@ -1777,6 +1821,7 @@ def main() -> None:
         )
         if result_grnboost2:
             all_results.append(result_grnboost2)
+        cleanup_gpu_memory()
 
         # Run Mutual Information baseline
         result_mi = run_mutual_information_baseline(
@@ -1784,6 +1829,7 @@ def main() -> None:
             target_genes, dataset_name
         )
         all_results.append(result_mi)
+        cleanup_gpu_memory()
 
         # Expression Prediction Accuracy Evaluation (DREAM5)
         print(f"\n{'='*80}")
