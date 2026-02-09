@@ -55,6 +55,8 @@ class AttentionExtractor:
         X: torch.Tensor | list,
         *,
         max_layers: int | None = None,
+        X_train: torch.Tensor | np.ndarray | None = None,
+        y_train: torch.Tensor | np.ndarray | None = None,
     ) -> dict[str, dict[str, torch.Tensor]]:
         """Extract attention weights from a fitted TabPFN model.
 
@@ -63,10 +65,18 @@ class AttentionExtractor:
         model : Any
             Fitted TabPFN model (TabPFNRegressor or TabPFNClassifier)
         X : torch.Tensor or list
-            Input data to extract attention for
+            Input data to extract attention for. Can be combined train+test data
+            when using single-pass extraction with X_train and y_train.
         max_layers : int, optional
             Maximum number of layers to extract attention from.
             If None, extracts from all layers.
+        X_train : torch.Tensor or np.ndarray, optional
+            Training data for single-pass extraction. When provided along with
+            y_train, performs a single forward pass that captures attention
+            from BOTH training and prediction phases.
+        y_train : torch.Tensor or np.ndarray, optional
+            Training targets for single-pass extraction. Must be provided when
+            X_train is provided.
 
         Returns
         -------
@@ -80,6 +90,16 @@ class AttentionExtractor:
                 'layer_1': {...},
                 ...
             }
+
+        Notes
+        -----
+        When X_train and y_train are provided (single-pass mode):
+        - X should contain combined train+test data
+        - y_train should contain only training targets
+        - TabPFN's single_eval_pos mechanism ensures:
+          * Positions [0:len(X_train)] are processed as training context
+          * Positions [len(X_train):] are processed as test samples (predicted)
+        - Attention weights are captured for ALL positions in both phases
         """
 
         # Get the underlying model architectures
@@ -109,8 +129,66 @@ class AttentionExtractor:
                         attn_modules[f"layer_{layer_idx}_between_items"] = layer.self_attn_between_items
 
         # Run forward pass to capture attention weights
-        with torch.no_grad():
-            _ = model.predict(X)
+        # Check if single-pass mode (train+test combined)
+        if X_train is not None and y_train is not None:
+            # Single-pass approach: capture attention from train AND predict phases
+            import numpy as np
+
+            # Convert to tensors if needed
+            if isinstance(X, list):
+                X = np.array(X)
+            if isinstance(X, np.ndarray):
+                X_tensor = torch.from_numpy(X).float()
+            else:
+                X_tensor = X
+
+            if isinstance(y_train, np.ndarray):
+                y_train_tensor = torch.from_numpy(y_train).float()
+            elif isinstance(y_train, list):
+                y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+            else:
+                y_train_tensor = y_train
+
+            # Get device from model
+            if hasattr(model, 'devices_') and model.devices_:
+                device = model.devices_[0]
+            else:
+                device = X_tensor.device
+
+            X_tensor = X_tensor.to(device)
+            y_train_tensor = y_train_tensor.to(device)
+
+            # Reshape for TabPFN format
+            # X: (seq_len, batch, n_features) where seq_len = n_train + n_test
+            # y: (n_train, batch, 1) - only training targets!
+            X_input = X_tensor.unsqueeze(1)  # (n_train + n_test, 1, n_features)
+            y_input = y_train_tensor.unsqueeze(1).unsqueeze(2)  # (n_train, 1, 1)
+
+            # CRITICAL: TabPFN automatically sets single_eval_pos = y_input.shape[0] = n_train
+            # This causes:
+            # - Training phase: positions [0:n_train] processed with y values
+            # - Prediction phase: positions [n_train:end] processed WITHOUT y
+            # Attention is computed for ALL positions in both phases!
+
+            # Get the underlying model architecture
+            if not hasattr(model, "models_") or not model.models_:
+                raise ValueError("Model must be fitted before extracting attention")
+
+            model_arch = model.models_[0]  # Use first model
+
+            with torch.no_grad():
+                outputs = model_arch.forward(
+                    x={"main": X_input},
+                    y={"main": y_input},
+                    only_return_standard_out=True,
+                )
+
+            # Output shape: (n_test, batch, n_out) - predictions for test samples only
+            # But attention_weights contain patterns from BOTH phases!
+        else:
+            # Original behavior: simple predict
+            with torch.no_grad():
+                _ = model.predict(X)
 
         # Retrieve attention weights from modules BEFORE disabling
         attention_weights = self._retrieve_attention_weights(attn_modules)

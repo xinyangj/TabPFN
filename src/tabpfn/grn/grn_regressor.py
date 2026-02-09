@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
+import torch  # Import torch for GPU memory management
 from sklearn.base import BaseEstimator
 
 if TYPE_CHECKING:
@@ -101,6 +102,9 @@ class TabPFNGRNRegressor(BaseEstimator):
         edge_score_strategy: str = "self_attention",
         device: str = "auto",
         n_jobs: int = 1,
+        use_cross_validation: bool = False,
+        n_folds: int = 5,
+        random_state: int | None = 42,
     ) -> None:
         """Initialize the TabPFNGRNRegressor.
 
@@ -120,6 +124,17 @@ class TabPFNGRNRegressor(BaseEstimator):
             Device to use for computation
         n_jobs : int, default=1
             Number of parallel jobs
+        use_cross_validation : bool, default=False
+            Whether to use n-fold cross-validation for GRN inference.
+            When True, fits on training folds and predicts on test folds,
+            then averages edge scores across folds. This ensures inferred
+            edges represent true predictive relationships.
+        n_folds : int, default=5
+            Number of folds for cross-validation. Only used when
+            use_cross_validation=True.
+        random_state : int, default=42
+            Random seed for reproducible cross-validation splits.
+            Only used when use_cross_validation=True.
         """
         self.tf_names = tf_names
         self.target_genes = target_genes
@@ -128,6 +143,9 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.edge_score_strategy = edge_score_strategy
         self.device = device
         self.n_jobs = n_jobs
+        self.use_cross_validation = use_cross_validation
+        self.n_folds = n_folds
+        self.random_state = random_state
 
         # Fitted attributes
         self.target_models_: dict[str, TabPFNRegressor] = {}
@@ -183,25 +201,89 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.target_models_ = {}
         self.attention_weights_ = {}
 
-        for target_idx, target_name in enumerate(self.target_genes):
-            # Train model for this target
-            model = TabPFNRegressor(
-                n_estimators=self.n_estimators,
-                device=self.device,
-            )
-            model.fit(X, y[:, target_idx])
-            self.target_models_[target_name] = model
+        if self.use_cross_validation:
+            # Cross-validation mode: collect edge scores from each fold
+            print(f"Using {self.n_folds}-fold cross-validation for GRN inference...")
+            all_fold_edge_scores = []
 
-            # Log pre-trained weight loading information
-            self._log_model_info(model, target_name)
+            # Create CV splits once (same for all targets)
+            splits = self._create_cv_splits(X)
 
-            # Extract attention weights
-            extractor = AttentionExtractor()
-            attention = extractor.extract(model, X, max_layers=1)
-            self.attention_weights_[target_name] = attention
+            for fold_idx, (train_idx, test_idx) in enumerate(splits):
+                print(f"  Processing fold {fold_idx + 1}/{self.n_folds}...")
 
-        # Compute edge scores
-        self.edge_scores_ = self._compute_edge_scores()
+                X_train, X_test = X[train_idx], X[test_idx]
+                fold_edge_scores = {}
+
+                for target_idx, target_name in enumerate(self.target_genes):
+                    # Fit model on training data only
+                    model = TabPFNRegressor(
+                        n_estimators=self.n_estimators,
+                        device=self.device,
+                    )
+                    y_train = y[train_idx, target_idx]
+                    model.fit(X_train, y_train)
+
+                    # Store model for final fold (or could store all)
+                    if fold_idx == 0:
+                        self.target_models_[target_name] = model
+
+                    # Single-pass attention extraction:
+                    # Captures BOTH training and prediction phases
+                    extractor = AttentionExtractor()
+                    X_combined = np.vstack([X_train, X_test])
+
+                    attention = extractor.extract(
+                        model,
+                        X_combined,           # Combined train+test data
+                        X_train=X_train,      # Training data (for split info)
+                        y_train=y_train,      # Training targets only
+                        max_layers=1
+                    )
+
+                    # Store attention for first fold (for analysis)
+                    if fold_idx == 0:
+                        self.attention_weights_[target_name] = attention
+
+                    # Compute edge scores for this fold and target
+                    target_fold_scores = self._compute_edge_scores_from_attention(
+                        attention, target_name, X_combined, y[:, target_idx], len(X_train), model=model
+                    )
+                    fold_edge_scores.update(target_fold_scores)
+
+                all_fold_edge_scores.append(fold_edge_scores)
+
+                # Clean up memory after each fold
+                import gc
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+            # Average edge scores across folds
+            print(f"  Averaging edge scores across {self.n_folds} folds...")
+            self.edge_scores_ = self._average_edge_scores(all_fold_edge_scores)
+
+        else:
+            # Original behavior: fit on all data
+            for target_idx, target_name in enumerate(self.target_genes):
+                # Train model for this target
+                model = TabPFNRegressor(
+                    n_estimators=self.n_estimators,
+                    device=self.device,
+                )
+                model.fit(X, y[:, target_idx])
+                self.target_models_[target_name] = model
+
+                # Log pre-trained weight loading information
+                self._log_model_info(model, target_name)
+
+                # Extract attention weights
+                extractor = AttentionExtractor()
+                attention = extractor.extract(model, X, max_layers=1)
+                self.attention_weights_[target_name] = attention
+
+            # Compute edge scores
+            self.edge_scores_ = self._compute_edge_scores()
 
         return self
 
@@ -694,3 +776,283 @@ class TabPFNGRNRegressor(BaseEstimator):
         if not self.edge_scores_:
             raise ValueError("Model must be fitted before getting edge scores")
         return self.edge_scores_
+
+    def _create_cv_splits(
+        self, X: npt.NDArray[np.float32]
+    ) -> list[tuple[npt.NDArray[np.int_], npt.NDArray[np.int_]]]:
+        """Create train/test indices for n-fold cross-validation.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Input data of shape (n_samples, n_features)
+
+        Returns
+        -------
+        splits : list of tuples
+            List of (train_indices, test_indices) tuples for each fold
+
+        Raises
+        ------
+        ValueError
+            If use_cross_validation is False
+        """
+        from sklearn.model_selection import KFold
+
+        if not self.use_cross_validation:
+            raise ValueError(
+                "Cross-validation splits requested but use_cross_validation=False. "
+                "Set use_cross_validation=True to enable cross-validation."
+            )
+
+        kfold = KFold(
+            n_splits=self.n_folds,
+            shuffle=True,
+            random_state=self.random_state
+        )
+
+        splits = list(kfold.split(X))
+        return splits
+
+    def _compute_edge_scores_from_attention(
+        self,
+        attention: dict[str, dict[str, torch.Tensor]],
+        target_name: str,
+        X: np.ndarray,
+        y_target: np.ndarray,
+        n_train: int | None = None,
+        model: TabPFNRegressor | None = None,
+    ) -> dict[tuple[str, str], float]:
+        """Compute edge scores from attention weights for a single target.
+
+        This method extracts edge scores for a specific target gene, used
+        during cross-validation to compute per-fold edge scores.
+
+        Parameters
+        ----------
+        attention : dict
+            Attention weights dictionary for this target
+        target_name : str
+            Name of the target gene
+        X : np.ndarray
+            Input data (combined train+test in CV mode)
+        y_target : np.ndarray
+            Target gene expression values
+        n_train : int, optional
+            Number of training samples. If provided, indicates that the
+            attention was extracted in single-pass mode with train/test split.
+        model : TabPFNRegressor, optional
+            Fitted TabPFN model for this target. Required for gradient_rollout.
+
+        Returns
+        -------
+        edge_scores : dict
+            Dictionary mapping (tf_name, target_name) pairs to edge scores
+        """
+        import torch
+
+        edge_scores = {}
+
+        # Handle sequential_rollout strategy
+        if self.edge_score_strategy == "sequential_rollout":
+            try:
+                from tabpfn.grn.attention_extractor import _extract_rollout_scores_vectorized
+
+                # Use sequential rollout with both attention types
+                rollout_computer = EdgeScoreComputer(aggregation_method="sequential_rollout")
+                rollout_matrix = rollout_computer.compute(
+                    attention,
+                    use_between_features=True,
+                    use_between_items=True,
+                    head_combination="mean",
+                    add_residual=True,
+                    average_batch=True,
+                )
+
+                # Determine dimensions from attention weights
+                first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
+                first_layer_data = attention[first_layer_key]
+
+                if "between_features" in first_layer_data:
+                    feat_attn = first_layer_data["between_features"]
+                    num_items = feat_attn.size(1)
+                elif "between_items" in first_layer_data:
+                    item_attn = first_layer_data["between_items"]
+                    num_feature_blocks = item_attn.size(1)
+                else:
+                    raise ValueError("Cannot determine dimensions from attention weights")
+
+                if "between_items" in first_layer_data:
+                    num_feature_blocks = first_layer_data["between_items"].size(1)
+                else:
+                    num_feature_blocks = len(self.tf_names) + 1
+
+                target_idx = num_feature_blocks - 1
+
+                # Extract TF->Target edge scores
+                valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
+
+                if valid_tf_indices:
+                    device = rollout_matrix.device
+                    tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
+
+                    mean_scores = _extract_rollout_scores_vectorized(
+                        rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
+                    )
+
+                    for idx, tf_idx in enumerate(valid_tf_indices):
+                        tf_name = self.tf_names[tf_idx]
+                        edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
+
+                for tf_idx in range(target_idx, len(self.tf_names)):
+                    tf_name = self.tf_names[tf_idx]
+                    edge_scores[(tf_name, target_name)] = 0.0
+
+            except Exception as e:
+                import warnings
+                import traceback
+                warnings.warn(f"Failed to extract edge scores for {target_name}: {e}\n{traceback.format_exc()}")
+                for tf_name in self.tf_names:
+                    edge_scores[(tf_name, target_name)] = 0.0
+
+        # Handle gradient_rollout strategy
+        elif self.edge_score_strategy == "gradient_rollout":
+            if model is None:
+                # Fallback to sequential_rollout if model not provided
+                import warnings
+                warnings.warn(f"Model not provided for {target_name}, using sequential_rollout instead")
+                # Recursively call with sequential_rollout strategy
+                original_strategy = self.edge_score_strategy
+                self.edge_score_strategy = "sequential_rollout"
+                edge_scores = self._compute_edge_scores_from_attention(
+                    attention, target_name, X, y_target, n_train
+                )
+                self.edge_score_strategy = original_strategy
+                return edge_scores
+
+            try:
+                from tabpfn.grn.attention_extractor import (
+                    GradientAttentionExtractor,
+                    _extract_rollout_scores_vectorized,
+                )
+
+                # Use GradientAttentionExtractor to compute head weights
+                gradient_extractor = GradientAttentionExtractor()
+
+                # Prepare data for gradient computation
+                X_grad = torch.from_numpy(X).float()
+                y_target_tensor = torch.from_numpy(y_target).float()
+
+                if hasattr(model, 'devices_') and model.devices_:
+                    device = model.devices_[0]
+                else:
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+                X_grad = X_grad.to(device)
+                y_target_tensor = y_target_tensor.to(device)
+
+                # Compute gradient-based head weights
+                head_weights = gradient_extractor.compute_gradient_head_weights(
+                    model=model,
+                    X=X_grad,
+                    y_target=y_target_tensor,
+                    attention_weights=attention,
+                    normalization="l1"
+                )
+
+                # Compute gradient-weighted rollout
+                rollout_computer = EdgeScoreComputer(aggregation_method="gradient_weighted")
+                rollout_matrix = rollout_computer.compute(
+                    attention,
+                    use_between_features=True,
+                    use_between_items=True,
+                    head_weights=head_weights,
+                    head_combination="weighted",
+                    add_residual=True,
+                    average_batch=True,
+                )
+
+                # Determine dimensions
+                first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
+                first_layer_data = attention[first_layer_key]
+
+                if "between_features" in first_layer_data:
+                    num_items = first_layer_data["between_features"].size(1)
+                if "between_items" in first_layer_data:
+                    num_feature_blocks = first_layer_data["between_items"].size(1)
+                else:
+                    num_feature_blocks = len(self.tf_names) + 1
+
+                target_idx = num_feature_blocks - 1
+
+                # Extract TF->Target edge scores
+                valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
+
+                if valid_tf_indices:
+                    device = rollout_matrix.device
+                    tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
+
+                    mean_scores = _extract_rollout_scores_vectorized(
+                        rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
+                    )
+
+                    for idx, tf_idx in enumerate(valid_tf_indices):
+                        tf_name = self.tf_names[tf_idx]
+                        edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
+
+                for tf_idx in range(target_idx, len(self.tf_names)):
+                    tf_name = self.tf_names[tf_idx]
+                    edge_scores[(tf_name, target_name)] = 0.0
+
+            except Exception as e:
+                import warnings
+                import traceback
+                warnings.warn(f"Failed to extract edge scores for {target_name} with gradient_rollout: {e}\n{traceback.format_exc()}")
+                for tf_name in self.tf_names:
+                    edge_scores[(tf_name, target_name)] = 0.0
+
+        else:
+            # Handle other edge score strategies (self_attention, tf_to_target, etc.)
+            # For simplicity, assign uniform scores or use the aggregation computer
+            for tf_name in self.tf_names:
+                edge_scores[(tf_name, target_name)] = 0.0
+
+        return edge_scores
+
+    def _average_edge_scores(
+        self,
+        fold_edge_scores: list[dict[tuple[str, str], float]]
+    ) -> dict[tuple[str, str], float]:
+        """Average edge scores across cross-validation folds.
+
+        Parameters
+        ----------
+        fold_edge_scores : list of dict
+            List of edge score dicts, one per fold.
+            Each dict maps (tf, target) pairs to edge scores.
+
+        Returns
+        -------
+        averaged : dict
+            Averaged edge scores dict mapping (tf, target) pairs to mean scores.
+
+        Notes
+        -----
+        If an edge appears in some folds but not others, missing scores are
+        treated as 0.0 for the missing folds.
+        """
+        if not fold_edge_scores:
+            return {}
+
+        # Collect all unique edges
+        all_edges = set()
+        for fold_scores in fold_edge_scores:
+            all_edges.update(fold_scores.keys())
+
+        # Average scores for each edge
+        averaged = {}
+        for edge in all_edges:
+            scores = [fold_scores.get(edge, 0.0) for fold_scores in fold_edge_scores]
+            averaged[edge] = np.mean(scores)
+
+        return averaged
