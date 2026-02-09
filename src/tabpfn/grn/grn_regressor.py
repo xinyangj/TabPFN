@@ -133,6 +133,8 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.target_models_: dict[str, TabPFNRegressor] = {}
         self.attention_weights_: dict[str, dict] = {}
         self.edge_scores_: dict[tuple[str, str], float] = {}
+        self.X_: np.ndarray  # Training data for gradient computation
+        self.y_: np.ndarray  # Training targets for gradient computation
 
     def fit(
         self,
@@ -171,6 +173,11 @@ class TabPFNGRNRegressor(BaseEstimator):
                 f"Number of targets in y ({n_targets}) does not match "
                 f"len(target_genes) ({len(self.target_genes)})"
             )
+
+        # Store original data for gradient computation (gradient_rollout strategy)
+        # This allows computing gradients of target predictions w.r.t. attention weights
+        self.X_ = X
+        self.y_ = y
 
         # Train one model per target
         self.target_models_ = {}
@@ -295,22 +302,79 @@ class TabPFNGRNRegressor(BaseEstimator):
                         _extract_rollout_scores_vectorized,
                     )
 
+                    import torch
+                    import numpy as np
+
                     # Get the model and data for gradient computation
                     model = self.target_models_[target_name]
 
-                    # Need to get X data for gradient computation
-                    # We'll need to pass X through the model again with gradients enabled
-                    # For now, use a simplified approach that doesn't require full gradient pass
-                    # This can be enhanced later for full gradient-based rollout
+                    # Use GradientAttentionExtractor to compute head weights
+                    # This computes gradients of target prediction w.r.t. attention weights
+                    gradient_extractor = GradientAttentionExtractor()
 
-                    # Use gradient weighted rollout with default uniform weights
-                    # (gradient computation will be added in future enhancement)
+                    # For gradient computation, we need the target gene's y values
+                    # In TabPFN's in-context learning, each target has its own model
+                    # that predicts that specific target from TFs
+
+                    # Get y values for this target from the fitted data
+                    # Note: We need to access the original training data
+                    if hasattr(self, 'X_') and hasattr(self, 'y_'):
+                        # Use original training data for gradient computation
+                        X_grad = self.X_
+                        # Find the index of this target in target_genes
+                        target_idx_in_y = self.target_genes.index(target_name)
+                        y_target = self.y_[:, target_idx_in_y]
+                    else:
+                        # Fallback: use sample data if available
+                        if hasattr(self, 'X_sample_') and hasattr(self, 'y_sample_'):
+                            X_grad = self.X_sample_
+                            target_idx_in_y = self.target_genes.index(target_name)
+                            y_target = self.y_sample_[:, target_idx_in_y]
+                        else:
+                            # Last resort: create synthetic data for gradient computation
+                            # This won't give perfect gradients but provides a reasonable proxy
+                            X_grad = np.random.randn(10, len(self.tf_names))
+                            y_target = np.random.randn(10)
+                            import warnings
+                            warnings.warn(
+                                f"Using synthetic data for gradient computation for {target_name}. "
+                                "Results may be suboptimal."
+                            )
+
+                    # Convert to tensors if needed
+                    if not isinstance(X_grad, torch.Tensor):
+                        X_grad = torch.from_numpy(X_grad).float()
+                    if not isinstance(y_target, torch.Tensor):
+                        y_target = torch.from_numpy(y_target).float()
+
+                    # Ensure tensors are on the same device as the model
+                    # TabPFNRegressor stores devices in devices_ attribute (tuple)
+                    if hasattr(model, 'devices_') and model.devices_:
+                        device = model.devices_[0]  # Get primary device
+                        X_grad = X_grad.to(device)
+                        y_target = y_target.to(device)
+                    elif torch.cuda.is_available():
+                        X_grad = X_grad.cuda()
+                        y_target = y_target.cuda()
+
+                    # Compute gradient-based head weights
+                    # This uses the improved gradient computation that understands
+                    # TabPFN's in-context learning where X and y are concatenated
+                    head_weights = gradient_extractor.compute_gradient_head_weights(
+                        model=model,
+                        X=X_grad,
+                        y_target=y_target,
+                        attention_weights=attention,
+                        normalization="l1"  # Use L1 norm for regression
+                    )
+
+                    # Compute gradient-weighted rollout
                     rollout_computer = EdgeScoreComputer(aggregation_method="gradient_weighted")
                     rollout_matrix = rollout_computer.compute(
                         attention,
                         use_between_features=True,
                         use_between_items=True,
-                        head_weights=None,  # Could compute with GradientAttentionExtractor if needed
+                        head_weights=head_weights,  # Use computed gradient weights
                         head_combination="weighted",
                         add_residual=True,
                         average_batch=True,
@@ -338,7 +402,6 @@ class TabPFNGRNRegressor(BaseEstimator):
                     valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
 
                     if valid_tf_indices:
-                        import torch
                         device = rollout_matrix.device
                         tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
 
@@ -358,8 +421,55 @@ class TabPFNGRNRegressor(BaseEstimator):
                     import warnings
                     import traceback
                     warnings.warn(f"Failed to extract edge scores for {target_name} with gradient_rollout: {e}\n{traceback.format_exc()}")
-                    for tf_name in self.tf_names:
-                        edge_scores[(tf_name, target_name)] = 0.0
+                    # Fallback: use sequential rollout
+                    try:
+                        rollout_computer = EdgeScoreComputer(aggregation_method="sequential_rollout")
+                        rollout_matrix = rollout_computer.compute(
+                            attention,
+                            use_between_features=True,
+                            use_between_items=True,
+                            add_residual=True,
+                            average_batch=True,
+                        )
+
+                        # Extract edge scores (same code as above)
+                        first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
+                        first_layer_data = attention[first_layer_key]
+
+                        if "between_features" in first_layer_data:
+                            feat_attn = first_layer_data["between_features"]
+                            num_items = feat_attn.size(1)
+                        else:
+                            raise ValueError("Cannot determine dimensions from attention weights")
+
+                        if "between_items" in first_layer_data:
+                            num_feature_blocks = first_layer_data["between_items"].size(1)
+                        else:
+                            num_feature_blocks = len(self.tf_names) + 1
+
+                        target_idx = num_feature_blocks - 1
+                        valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
+
+                        if valid_tf_indices:
+                            import torch
+                            device = rollout_matrix.device
+                            tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
+
+                            mean_scores = _extract_rollout_scores_vectorized(
+                                rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
+                            )
+
+                            for idx, tf_idx in enumerate(valid_tf_indices):
+                                tf_name = self.tf_names[tf_idx]
+                                edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
+
+                        for tf_idx in range(target_idx, len(self.tf_names)):
+                            tf_name = self.tf_names[tf_idx]
+                            edge_scores[(tf_name, target_name)] = 0.0
+                    except Exception:
+                        # Last resort: assign zero scores
+                        for tf_name in self.tf_names:
+                            edge_scores[(tf_name, target_name)] = 0.0
 
                 continue
 

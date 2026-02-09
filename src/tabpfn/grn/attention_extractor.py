@@ -656,18 +656,21 @@ class GradientAttentionExtractor(AttentionExtractor):
     ) -> dict[str, dict[str, torch.Tensor]]:
         """Compute gradient-based importance weights for each attention head.
 
-        For regression tasks, we compute gradients of the target prediction w.r.t.
-        attention outputs, then aggregate to get per-head importance scores.
-        This adapts the GMAR approach from classification to regression.
+        For GRN inference, we compute gradients of the target gene prediction
+        with respect to attention weights. This tells us which attention heads
+        are most important for predicting specific target genes from TFs.
+
+        This adapts GMAR (Gradient-Driven Multi-Head Attention Rollout) from
+        classification to regression for TabPFN's in-context learning setup.
 
         Parameters
         ----------
         model : Any
-            Fitted TabPFN model
+            Fitted TabPFNRegressor model
         X : torch.Tensor or list
             Input data (TF expression values)
         y_target : torch.Tensor
-            Target gene expression values (for gradient computation)
+            Target gene expression values for gradient computation
         attention_weights : dict
             Pre-extracted attention weights from self.extract()
         normalization : str, default='l1'
@@ -687,16 +690,25 @@ class GradientAttentionExtractor(AttentionExtractor):
 
         Notes
         -----
-        For regression (vs classification), we use the prediction itself rather
-        than a class logit as the target for gradient computation.
+        Key implementation details for TabPFN GRN inference:
+        1. Each target gene has its own TabPFN model (single-target approach)
+        2. X and y_target are concatenated in TabPFN's in-context learning
+        3. We compute gradients of target prediction w.r.t. attention outputs
+        4. Gradient magnitude indicates head importance for TF→target regulation
+
+        If gradient computation fails (TabPFN's complexity), falls back to
+        attention-magnitude-based weighting as a reasonable proxy.
         """
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Convert X to tensor if it's a list
+        # Convert X to tensor if needed
         if isinstance(X, list):
-            X = torch.tensor(X, device=device, dtype=torch.float32)
+            X = torch.cat([x if isinstance(x, torch.Tensor) else torch.tensor(x, device=device)
+                          for x in X], dim=0)
         elif isinstance(X, np.ndarray):
             X = torch.from_numpy(X).to(device=device, dtype=torch.float32)
+        elif not isinstance(X, torch.Tensor):
+            X = torch.tensor(X, device=device, dtype=torch.float32)
 
         # Convert y_target to tensor if needed
         if not isinstance(y_target, torch.Tensor):
@@ -707,46 +719,156 @@ class GradientAttentionExtractor(AttentionExtractor):
 
         head_weights: dict[str, dict[str, torch.Tensor]] = {}
 
-        # Process each model in the ensemble
+        # TabPFNRegressor wraps one or more PerFeatureTransformer models
+        # For GRN inference, we typically use n_estimators=1 for efficiency
         if hasattr(model, "models_") and model.models_:
+            # Process the first (and typically only) model in the ensemble
             for model_idx, model_arch in enumerate(model.models_):
                 if not hasattr(model_arch, "transformer_encoder"):
                     continue
 
                 encoder = model_arch.transformer_encoder
 
-                # Get gradient hooks for each layer
+                # Compute gradients using the model's internal forward pass
+                # This handles TabPFN's in-context learning where X and y are concatenated
                 gradients = self._compute_attention_gradients(
                     model_arch, X, y_target, encoder
                 )
 
-                # Compute head weights from gradients
-                for layer_idx in range(len(encoder.layers)):
-                    layer_key = f"layer_{layer_idx}"
+                # If gradient computation succeeded, compute head weights
+                if gradients:
+                    for layer_idx in range(len(encoder.layers)):
+                        layer_key = f"layer_{layer_idx}"
 
-                    if layer_key not in attention_weights:
-                        continue
-
-                    layer_data = attention_weights[layer_key]
-                    if layer_key not in head_weights:
-                        head_weights[layer_key] = {}
-
-                    # Compute weights for each attention type
-                    for attn_type in ["between_features", "between_items"]:
-                        if attn_type not in layer_data:
+                        if layer_key not in attention_weights:
                             continue
 
-                        # Get attention shape to determine number of heads
-                        attn = layer_data[attn_type]
-                        nheads = attn.size(-1)
+                        layer_data = attention_weights[layer_key]
+                        if layer_key not in head_weights:
+                            head_weights[layer_key] = {}
 
-                        # Compute gradient-based weights for this layer/type
-                        grad_key = f"{layer_key}_{attn_type}"
-                        if grad_key in gradients:
-                            weights = self._compute_weights_from_gradients(
-                                gradients[grad_key], nheads, normalization
-                            )
-                            head_weights[layer_key][attn_type] = weights
+                        # Compute weights for each attention type
+                        for attn_type in ["between_features", "between_items"]:
+                            if attn_type not in layer_data:
+                                continue
+
+                            # Get number of heads from attention weights
+                            attn = layer_data[attn_type]
+                            nheads = attn.size(-1)
+
+                            # Compute gradient-based weights
+                            grad_key = f"{layer_key}_{attn_type}"
+                            if grad_key in gradients:
+                                weights = self._compute_weights_from_gradients(
+                                    gradients[grad_key], nheads, normalization
+                                )
+                                head_weights[layer_key][attn_type] = weights
+                            else:
+                                # No gradient for this layer/type - use uniform weights
+                                head_weights[layer_key][attn_type] = torch.ones(
+                                    nheads, device=device
+                                ) / nheads
+                else:
+                    # Gradient computation failed - use attention-based weights
+                    import warnings
+                    warnings.warn(
+                        "Gradient computation failed. Using attention magnitude "
+                        "as proxy for head importance."
+                    )
+                    return self._compute_attention_based_head_weights(
+                        attention_weights, device
+                    )
+
+                # Break after first model (GRN uses n_estimators=1)
+                break
+
+        # Fallback: return uniform weights if no model found
+        if not head_weights:
+            import warnings
+            warnings.warn("Could not compute head weights. Using uniform weights.")
+            return self._compute_uniform_head_weights(attention_weights, device)
+
+        return head_weights
+
+    def _compute_attention_based_head_weights(
+        self,
+        attention_weights: dict[str, dict[str, torch.Tensor]],
+        device: torch.device,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        """Compute head importance from attention magnitude as gradient proxy.
+
+        When gradient computation is unavailable, use attention weight magnitudes
+        as a reasonable proxy for head importance.
+
+        Parameters
+        ----------
+        attention_weights : dict
+            Pre-extracted attention weights
+        device : torch.device
+            Device for tensor creation
+
+        Returns
+        -------
+        head_weights : dict
+            Head importance weights based on attention magnitude
+        """
+        head_weights = {}
+
+        for layer_key, layer_data in attention_weights.items():
+            if layer_key not in head_weights:
+                head_weights[layer_key] = {}
+
+            for attn_type, attn in layer_data.items():
+                # Compute average attention magnitude per head
+                # Shape: (batch, seq, seq, nheads) -> (nheads,)
+                if attn.dim() >= 4:
+                    # Average over batch and sequence dimensions
+                    head_magnitude = attn.abs().mean(dim=(0, 1, 2))
+                elif attn.dim() == 3:
+                    # (batch, seq, nheads)
+                    head_magnitude = attn.abs().mean(dim=(0, 1))
+                else:
+                    # Fallback to uniform weights
+                    nheads = attn.size(-1)
+                    head_magnitude = torch.ones(nheads, device=device) / nheads
+
+                # Normalize to sum to 1
+                head_weights[layer_key][attn_type] = (
+                    head_magnitude / (head_magnitude.sum() + 1e-8)
+                )
+
+        return head_weights
+
+    def _compute_uniform_head_weights(
+        self,
+        attention_weights: dict[str, dict[str, torch.Tensor]],
+        device: torch.device,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        """Return uniform weights for all attention heads.
+
+        Parameters
+        ----------
+        attention_weights : dict
+            Pre-extracted attention weights (used to determine nheads)
+        device : torch.device
+            Device for tensor creation
+
+        Returns
+        -------
+        head_weights : dict
+            Uniform weights for all heads
+        """
+        head_weights = {}
+
+        for layer_key, layer_data in attention_weights.items():
+            if layer_key not in head_weights:
+                head_weights[layer_key] = {}
+
+            for attn_type, attn in layer_data.items():
+                nheads = attn.size(-1)
+                head_weights[layer_key][attn_type] = torch.ones(
+                    nheads, device=device
+                ) / nheads
 
         return head_weights
 
@@ -759,49 +881,64 @@ class GradientAttentionExtractor(AttentionExtractor):
     ) -> dict[str, torch.Tensor]:
         """Compute gradients of prediction w.r.t. attention outputs.
 
+        Uses TabPFN's internal forward pass to compute gradients of the specific
+        target prediction with respect to attention weights. This enables
+        gradient-based head importance weighting for attention rollout.
+
         Parameters
         ----------
         model : Any
-            TabPFN model architecture
+            TabPFN model architecture (PerFeatureTransformer)
         X : torch.Tensor
-            Input features
+            Input features (TF expression)
         y_target : torch.Tensor
-            Target values for gradient computation
+            Target gene expression values for gradient computation
         encoder : Any
-            Transformer encoder
+            Transformer encoder containing attention layers
 
         Returns
         -------
         gradients : dict
             Dictionary mapping layer_attn_type to gradient tensors
+
+        Notes
+        -----
+        The key insight is that TabPFN uses in-context learning where:
+        1. X and y_target are concatenated as feature tokens
+        2. The model predicts the target gene from TF context
+        3. We compute gradients of this prediction w.r.t. attention weights
+        4. Gradient magnitude indicates head importance for target prediction
         """
         gradients: dict[str, torch.Tensor] = {}
-        hooks: list[Callable] = []
+        hooks: list[Any] = []
 
-        # Store model in eval mode but enable gradients
+        # Ensure model is in eval mode but gradients are enabled
         model.eval()
-        X = X.requires_grad_(True)
+        torch.set_grad_enabled(True)
 
         def make_gradient_hook(layer_key: str, attn_type: str) -> Callable:
-            """Create a hook to capture gradients from attention."""
+            """Create a hook to capture gradients from attention outputs."""
             def hook(module: Any, grad_input: tuple, grad_output: tuple) -> None:
-                # Capture gradients from the attention output
-                if grad_output[0] is not None:
+                # Capture gradients from attention output during backward pass
+                if grad_output and len(grad_output) > 0 and grad_output[0] is not None:
                     key = f"layer_{layer_key}_{attn_type}"
-                    # Store the gradient, reshaping to extract per-head info
-                    gradients[key] = grad_output[0].detach()
+                    # Store gradient preserving per-head information
+                    # Shape typically: (batch, seq_len, seq_len, nheads)
+                    gradients[key] = grad_output[0].detach().clone()
             return hook
 
-        # Register hooks on attention modules
+        # Register gradient hooks on all attention modules
         for layer_idx, layer in enumerate(encoder.layers):
             layer_key = str(layer_idx)
 
+            # Register hooks for between_features attention
             if hasattr(layer, "self_attn_between_features") and layer.self_attn_between_features is not None:
                 hook = layer.self_attn_between_features.register_full_backward_hook(
                     make_gradient_hook(layer_key, "between_features")
                 )
                 hooks.append(hook)
 
+            # Register hooks for between_items attention
             if hasattr(layer, "self_attn_between_items") and layer.self_attn_between_items is not None:
                 hook = layer.self_attn_between_items.register_full_backward_hook(
                     make_gradient_hook(layer_key, "between_items")
@@ -809,40 +946,155 @@ class GradientAttentionExtractor(AttentionExtractor):
                 hooks.append(hook)
 
         try:
-            # Forward pass - handle TabPFN's architecture which requires both X and y
-            # Try different approaches for gradient computation
-            try:
-                # Approach 1: Try standard forward pass (works for simple models)
-                y_pred = model(X)
-                if isinstance(y_pred, torch.Tensor):
-                    y_pred_scalar = y_pred.mean()
+            # Use TabPFN's internal forward mechanism for gradient computation
+            # TabPFNRegressor wraps PerFeatureTransformer which needs proper context
+            if hasattr(model, "forward") and hasattr(model, "config_"):
+                # Get model configuration for proper forward pass
+                config = model.config_
+
+                # Convert X to list format if needed (TabPFN's internal format)
+                if isinstance(X, torch.Tensor):
+                    X_list = [X]  # TabPFN expects list of tensors
                 else:
-                    # Handle numpy output or other formats
-                    y_pred_scalar = torch.tensor(y_pred).mean()
-            except (TypeError, AttributeError) as e:
-                # Approach 2: TabPFN requires both X and y for forward pass
-                # Fall back to using attention weights directly for head importance
+                    X_list = X
+
+                # Prepare y_target in the format TabPFN expects
+                # TabPFN concatenates X and y as: embedded_input = cat((embedded_x, embedded_y), dim=2)
+                # For gradient computation, we need to call forward with both X and y
+                try:
+                    # Try the full forward pass with both X and y
+                    # This is the proper way TabPFN processes in-context learning
+                    y_pred = model.forward(
+                        X_list,
+                        y=y_target.unsqueeze(0) if y_target.dim() == 1 else y_target,
+                        only_return_standard_out=True
+                    )
+
+                    # Handle prediction output
+                    if isinstance(y_pred, (list, tuple)):
+                        # TabPFN returns (predictions, logits, borders)
+                        y_pred_tensor = y_pred[0] if y_pred[0] is not None else torch.tensor(0.0)
+                    elif isinstance(y_pred, dict):
+                        # Extract predictions from dict
+                        y_pred_tensor = next(iter(y_pred.values())) if y_pred else torch.tensor(0.0)
+                    elif isinstance(y_pred, torch.Tensor):
+                        y_pred_tensor = y_pred
+                    else:
+                        y_pred_tensor = torch.tensor(y_pred, device=X.device)
+
+                    # Ensure gradient flow
+                    if not y_pred_tensor.requires_grad:
+                        # If predictions don't require grad, compute gradients differently
+                        # Use the attention weights directly to compute importance
+                        import warnings
+                        warnings.warn(
+                            "TabPFN predictions are detached from computation graph. "
+                            "Using attention-based head importance instead of gradients."
+                        )
+                        return self._compute_attention_based_weights(encoder)
+
+                except (TypeError, AttributeError, KeyError) as e:
+                    # Forward pass failed - try alternative approach
+                    import warnings
+                    warnings.warn(
+                        f"TabPFN forward pass failed for gradient computation: {e}. "
+                        "Falling back to attention-based head importance."
+                    )
+                    return self._compute_attention_based_weights(encoder)
+
+            elif hasattr(model, "predict"):
+                # Fallback: Use predict method (won't give gradients but provides baseline)
                 import warnings
                 warnings.warn(
-                    f"Gradient computation requires full TabPFN forward pass with y. "
-                    f"Using attention-based weighting instead. Error: {e}"
+                    "Model has predict() but not internal forward(). "
+                    "Cannot compute gradients - using uniform weights."
                 )
-                # Return empty gradients - the weighted rollout will use uniform weights
                 return {}
 
-            # Backward pass (for regression, use prediction directly)
-            y_pred_scalar.backward()
+            else:
+                import warnings
+                warnings.warn(
+                    "Model architecture not recognized for gradient computation. "
+                    "Using uniform head weights."
+                )
+                return {}
+
+            # Compute loss for gradient computation
+            # For regression, use MSE between prediction and target
+            # This gradient points in direction of improving target prediction
+            if y_pred_tensor.numel() > 1:
+                # Multiple predictions - compute mean loss
+                loss = torch.nn.functional.mse_loss(
+                    y_pred_tensor.flatten(),
+                    y_target.flatten() if y_target.numel() > 1 else y_target
+                )
+            else:
+                # Single prediction - compute scalar loss
+                loss = torch.nn.functional.mse_loss(y_pred_tensor, y_target.mean())
+
+            # Backward pass to compute gradients w.r.t. attention outputs
+            loss.backward()
 
         except Exception as e:
             import warnings
+            import traceback
             warnings.warn(
-                f"Failed to compute gradients: {e}. "
-                f"Gradient-weighted rollout will use uniform weights."
+                f"Gradient computation failed: {e}\n"
+                f"Traceback: {traceback.format_exc()}\n"
+                "Falling back to uniform head weights."
             )
             return {}
-            # Clean up hooks
+        finally:
+            # Always clean up hooks to prevent memory leaks
             for hook in hooks:
-                hook.remove()
+                try:
+                    hook.remove()
+                except Exception:
+                    pass  # Hook may already be removed or invalid
+
+        return gradients
+
+    def _compute_attention_based_weights(self, encoder: Any) -> dict[str, torch.Tensor]:
+        """Compute head importance based on attention magnitude when gradients unavailable.
+
+        This fallback method uses attention weight magnitudes as a proxy for head importance,
+        providing better weighting than uniform weights.
+
+        Parameters
+        ----------
+        encoder : Any
+            Transformer encoder containing attention layers
+
+        Returns
+        -------
+        gradients : dict
+            Dictionary mapping layer_attn_type to magnitude-based proxy tensors
+        """
+        import warnings
+        warnings.warn("Using attention magnitude as proxy for gradient-based importance")
+
+        gradients = {}
+
+        for layer_idx, layer in enumerate(encoder.layers):
+            layer_key = str(layer_idx)
+
+            # Try to get attention weights directly
+            for attn_type in ["between_features", "between_items"]:
+                attn_module = getattr(layer, f"self_attn_{attn_type}", None)
+                if attn_module is not None and hasattr(attn_module, "get_attention_weights"):
+                    try:
+                        attn_weights = attn_module.get_attention_weights()
+                        if attn_weights is not None:
+                            # Use attention magnitude as gradient proxy
+                            # Higher average attention = more important head
+                            key = f"layer_{layer_key}_{attn_type}"
+                            # Average over batch and sequence, keep per-head
+                            if attn_weights.dim() >= 4:  # (batch, seq, seq, heads)
+                                gradients[key] = attn_weights.abs().mean(dim=(0, 1, 2))
+                            elif attn_weights.dim() == 3:  # (batch, seq, heads)
+                                gradients[key] = attn_weights.abs().mean(dim=(0, 1))
+                    except Exception:
+                        pass
 
         return gradients
 
