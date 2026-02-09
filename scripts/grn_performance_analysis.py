@@ -1451,6 +1451,7 @@ def main() -> None:
         "target_to_tf",
         "combined",
         "combined_best",
+        "sequential_rollout",  # New: unified attention rollout
     ]
 
     # ============================================================================
@@ -1515,64 +1516,54 @@ def main() -> None:
         if result_grnboost2:
             all_results.append(result_grnboost2)
 
-    # Expression Prediction Accuracy Evaluation (DREAM4-10)
-    print("\n" + "="*80)
-    print("EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-10)")
-    print("="*80)
+        # Expression Prediction Accuracy Evaluation (per network)
+        print(f"\n{'='*80}")
+        print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-10, network {network_id})")
+        print(f"{'='*80}")
 
-    # TabPFN variants (using network 1 data)
-    for strategy in tabpfn_strategies:
-        result = evaluate_expression_accuracy(
+        # Note: All TabPFN strategies produce identical predictions (edge strategy only affects edge extraction)
+        # So we only test one strategy for expression prediction
+        result_tabpfn_expr = evaluate_expression_accuracy(
             X, y, tf_names, target_genes,
             model_class=TabPFNRegressorWrapper,
             model_kwargs={
                 "n_estimators": 1,
-                "edge_score_strategy": strategy
+                "edge_score_strategy": "self_attention"
             },
-            method_name=f"TabPFN ({strategy})"
+            method_name="TabPFN"
         )
-        result["dataset"] = "DREAM4_10_Expr"
-        all_expression_results.append(result)
+        result_tabpfn_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
+        all_expression_results.append(result_tabpfn_expr)
 
-    # GENIE3
-    result_genie3_expr = evaluate_expression_accuracy(
-        X, y, tf_names, target_genes,
-        model_class=GENIE3RegressorWrapper,
-        model_kwargs={"n_estimators": 50},  # Reduced for speed
-        method_name="GENIE3"
-    )
-    result_genie3_expr["dataset"] = "DREAM4_10_Expr"
-    all_expression_results.append(result_genie3_expr)
+        # GENIE3
+        result_genie3_expr = evaluate_expression_accuracy(
+            X, y, tf_names, target_genes,
+            model_class=GENIE3RegressorWrapper,
+            model_kwargs={"n_estimators": 50},
+            method_name="GENIE3"
+        )
+        result_genie3_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
+        all_expression_results.append(result_genie3_expr)
 
-    # GRNBoost2
-    result_grnboost2_expr = evaluate_expression_accuracy(
-        X, y, tf_names, target_genes,
-        model_class=GRNBoost2RegressorWrapper,
-        model_kwargs={"n_estimators": 50},  # Reduced for speed
-        method_name="GRNBoost2"
-    )
-    result_grnboost2_expr["dataset"] = "DREAM4_10_Expr"
-    all_expression_results.append(result_grnboost2_expr)
+        # GRNBoost2
+        result_grnboost2_expr = evaluate_expression_accuracy(
+            X, y, tf_names, target_genes,
+            model_class=GRNBoost2RegressorWrapper,
+            model_kwargs={"n_estimators": 50},
+            method_name="GRNBoost2"
+        )
+        result_grnboost2_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
+        all_expression_results.append(result_grnboost2_expr)
 
-    # Correlation (Linear Regression)
-    result_corr_expr = evaluate_expression_accuracy(
-        X, y, tf_names, target_genes,
-        model_class=CorrelationPredictorWrapper,
-        model_kwargs={},
-        method_name="Correlation (LR)"
-    )
-    result_corr_expr["dataset"] = "DREAM4_10_Expr"
-    all_expression_results.append(result_corr_expr)
-
-    # Mutual Information (Linear Regression)
-    result_mi_expr = evaluate_expression_accuracy(
-        X, y, tf_names, target_genes,
-        model_class=MutualInfoPredictorWrapper,
-        model_kwargs={},
-        method_name="Mutual Info (LR)"
-    )
-    result_mi_expr["dataset"] = "DREAM4_10_Expr"
-    all_expression_results.append(result_mi_expr)
+        # Linear Regression (represents both Correlation and MI - both use LR for prediction)
+        result_lr_expr = evaluate_expression_accuracy(
+            X, y, tf_names, target_genes,
+            model_class=CorrelationPredictorWrapper,
+            model_kwargs={},
+            method_name="Linear Regression"
+        )
+        result_lr_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
+        all_expression_results.append(result_lr_expr)
 
     # ============================================================================
     # DREAM4 Analysis (100 genes - larger test)
@@ -1625,24 +1616,30 @@ def main() -> None:
     if result_grnboost2:
         all_results.append(result_grnboost2)
 
-    # Expression Prediction Accuracy Evaluation (DREAM4-100)
-    print("\n" + "="*80)
-    print("EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-100)")
-    print("="*80)
+    # Run Mutual Information baseline
+    result_mi = run_mutual_information_baseline(
+        expression, gene_names, tf_names, gold_standard,
+        target_genes, dataset_name
+    )
+    all_results.append(result_mi)
 
-    # TabPFN variants (select strategies for speed)
-    for strategy in ["self_attention", "combined_best"]:
-        result = evaluate_expression_accuracy(
-            X, y, tf_names, target_genes,
-            model_class=TabPFNRegressorWrapper,
-            model_kwargs={
-                "n_estimators": 1,
-                "edge_score_strategy": strategy
-            },
-            method_name=f"TabPFN ({strategy})"
-        )
-        result["dataset"] = "DREAM4_100_Expr"
-        all_expression_results.append(result)
+    # Expression Prediction Accuracy Evaluation (DREAM4-100)
+    print(f"\n{'='*80}")
+    print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-100)")
+    print(f"{'='*80}")
+
+    # TabPFN (only one strategy needed - all produce identical predictions)
+    result_tabpfn_expr = evaluate_expression_accuracy(
+        X, y, tf_names, target_genes,
+        model_class=TabPFNRegressorWrapper,
+        model_kwargs={
+            "n_estimators": 1,
+            "edge_score_strategy": "self_attention"
+        },
+        method_name="TabPFN"
+    )
+    result_tabpfn_expr["dataset"] = "DREAM4_100_Expr"
+    all_expression_results.append(result_tabpfn_expr)
 
     # GENIE3
     result_genie3_expr = evaluate_expression_accuracy(
@@ -1654,15 +1651,25 @@ def main() -> None:
     result_genie3_expr["dataset"] = "DREAM4_100_Expr"
     all_expression_results.append(result_genie3_expr)
 
-    # Correlation (Linear Regression)
-    result_corr_expr = evaluate_expression_accuracy(
+    # GRNBoost2
+    result_grnboost2_expr = evaluate_expression_accuracy(
+        X, y, tf_names, target_genes,
+        model_class=GRNBoost2RegressorWrapper,
+        model_kwargs={"n_estimators": 50},
+        method_name="GRNBoost2"
+    )
+    result_grnboost2_expr["dataset"] = "DREAM4_100_Expr"
+    all_expression_results.append(result_grnboost2_expr)
+
+    # Linear Regression (represents both Correlation and MI)
+    result_lr_expr = evaluate_expression_accuracy(
         X, y, tf_names, target_genes,
         model_class=CorrelationPredictorWrapper,
         model_kwargs={},
-        method_name="Correlation (LR)"
+        method_name="Linear Regression"
     )
-    result_corr_expr["dataset"] = "DREAM4_100_Expr"
-    all_expression_results.append(result_corr_expr)
+    result_lr_expr["dataset"] = "DREAM4_100_Expr"
+    all_expression_results.append(result_lr_expr)
 
     # ============================================================================
     # DREAM5 E. coli Analysis (real data)
@@ -1771,24 +1778,30 @@ def main() -> None:
         if result_grnboost2:
             all_results.append(result_grnboost2)
 
-        # Expression Prediction Accuracy Evaluation (DREAM5)
-        print("\n" + "="*80)
-        print("EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM5 E. coli)")
-        print("="*80)
+        # Run Mutual Information baseline
+        result_mi = run_mutual_information_baseline(
+            expression_for_baseline, gene_names_for_baseline, tf_names_filtered, filtered_gold_standard,
+            target_genes, dataset_name
+        )
+        all_results.append(result_mi)
 
-        # TabPFN variants (select strategies for speed)
-        for strategy in ["self_attention", "combined_best"]:
-            result = evaluate_expression_accuracy(
-                X, y_subset, tf_names_filtered, target_genes,
-                model_class=TabPFNRegressorWrapper,
-                model_kwargs={
-                    "n_estimators": 1,
-                    "edge_score_strategy": strategy
-                },
-                method_name=f"TabPFN ({strategy})"
-            )
-            result["dataset"] = "DREAM5_Ecoli_Expr"
-            all_expression_results.append(result)
+        # Expression Prediction Accuracy Evaluation (DREAM5)
+        print(f"\n{'='*80}")
+        print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM5 E. coli)")
+        print(f"{'='*80}")
+
+        # TabPFN (only one strategy needed)
+        result_tabpfn_expr = evaluate_expression_accuracy(
+            X, y_subset, tf_names_filtered, target_genes,
+            model_class=TabPFNRegressorWrapper,
+            model_kwargs={
+                "n_estimators": 1,
+                "edge_score_strategy": "self_attention"
+            },
+            method_name="TabPFN"
+        )
+        result_tabpfn_expr["dataset"] = "DREAM5_Ecoli_Expr"
+        all_expression_results.append(result_tabpfn_expr)
 
         # GENIE3
         result_genie3_expr = evaluate_expression_accuracy(
@@ -1800,15 +1813,25 @@ def main() -> None:
         result_genie3_expr["dataset"] = "DREAM5_Ecoli_Expr"
         all_expression_results.append(result_genie3_expr)
 
-        # Correlation (Linear Regression)
-        result_corr_expr = evaluate_expression_accuracy(
+        # GRNBoost2
+        result_grnboost2_expr = evaluate_expression_accuracy(
+            X, y_subset, tf_names_filtered, target_genes,
+            model_class=GRNBoost2RegressorWrapper,
+            model_kwargs={"n_estimators": 50},
+            method_name="GRNBoost2"
+        )
+        result_grnboost2_expr["dataset"] = "DREAM5_Ecoli_Expr"
+        all_expression_results.append(result_grnboost2_expr)
+
+        # Linear Regression (represents both Correlation and MI)
+        result_lr_expr = evaluate_expression_accuracy(
             X, y_subset, tf_names_filtered, target_genes,
             model_class=CorrelationPredictorWrapper,
             model_kwargs={},
-            method_name="Correlation (LR)"
+            method_name="Linear Regression"
         )
-        result_corr_expr["dataset"] = "DREAM5_Ecoli_Expr"
-        all_expression_results.append(result_corr_expr)
+        result_lr_expr["dataset"] = "DREAM5_Ecoli_Expr"
+        all_expression_results.append(result_lr_expr)
     except Exception as e:
         import traceback
         print(f"DREAM5 E. coli analysis skipped: {e}")

@@ -489,9 +489,9 @@ class AttentionHeatmapVisualizer:
         fig : plt.Figure or None
         """
         # Get between-features attention for each layer
-        layers = sorted([k for k in attention_dict.keys() if k.startswith("layer_")])
+        layers = sorted([k for k in attention_dict.keys() if k.startswith("layer_")], key=lambda x: int(x.split('_')[1]))
         if not layers:
-            layers = sorted(attention_dict.keys())
+            layers = sorted(attention_dict.keys(), key=lambda x: int(x.split('_')[1]))
 
         n_layers = len(layers)
         n_cols = min(4, n_layers)

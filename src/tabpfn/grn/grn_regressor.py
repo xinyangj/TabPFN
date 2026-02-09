@@ -56,6 +56,8 @@ class TabPFNGRNRegressor(BaseEstimator):
         - 'target_to_tf': Use feat_attn[-1, tf_idx] (Target attends to TF)
         - 'combined': Weighted average of all three
         - 'combined_best': Weighted average of self_attention and tf_to_target (recommended)
+        - 'sequential_rollout': Use attention rollout across layers with both between_features
+          and between_items attention (new, potentially better for GRN inference)
 
     device : str, default='auto'
         Device to use for computation ('auto', 'cpu', 'cuda')
@@ -203,7 +205,82 @@ class TabPFNGRNRegressor(BaseEstimator):
         computer = EdgeScoreComputer(aggregation_method=self.attention_aggregation)
 
         for target_name, attention in self.attention_weights_.items():
-            # Compute aggregated attention for this target
+            # Handle sequential_rollout strategy separately
+            if self.edge_score_strategy == "sequential_rollout":
+                try:
+                    # Use sequential rollout with both attention types
+                    rollout_computer = EdgeScoreComputer(aggregation_method="sequential_rollout")
+                    rollout_matrix = rollout_computer.compute(
+                        attention,
+                        use_between_features=True,
+                        use_between_items=True,
+                        head_combination="mean",
+                        add_residual=True,
+                        average_batch=True,
+                    )
+
+                    # Extract edge scores from rollout matrix
+                    # rollout_matrix is (N, N) where N = num_items * num_feature_blocks
+                    # We need to determine num_items and num_feature_blocks from the attention
+                    first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
+                    first_layer_data = attention[first_layer_key]
+
+                    if "between_features" in first_layer_data:
+                        feat_attn = first_layer_data["between_features"]
+                        num_items = feat_attn.size(1)  # (batch, num_items, num_items, nheads)
+                    elif "between_items" in first_layer_data:
+                        item_attn = first_layer_data["between_items"]
+                        num_feature_blocks = item_attn.size(1)  # (batch, num_fblocks, num_fblocks, nheads)
+                    else:
+                        raise ValueError("Cannot determine dimensions from attention weights")
+
+                    # Get the other dimension
+                    if "between_items" in first_layer_data:
+                        num_feature_blocks = first_layer_data["between_items"].size(1)
+                    else:
+                        # Fallback: assume target is included in feature blocks
+                        num_feature_blocks = len(self.tf_names) + 1
+
+                    # Target position is the last feature block
+                    target_idx = num_feature_blocks - 1
+
+                    # Extract TF->Target edge scores from rollout matrix (VECTORIZED)
+                    # Get valid TF indices (those before target_idx)
+                    valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
+
+                    if valid_tf_indices:
+                        # Convert to tensor and extract scores using vectorized utility
+                        import torch
+                        from tabpfn.grn.attention_extractor import _extract_rollout_scores_vectorized
+
+                        device = rollout_matrix.device
+                        tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
+
+                        # Extract all scores at once
+                        mean_scores = _extract_rollout_scores_vectorized(
+                            rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
+                        )
+
+                        # Build edge_scores dictionary
+                        for idx, tf_idx in enumerate(valid_tf_indices):
+                            tf_name = self.tf_names[tf_idx]
+                            edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
+
+                    # Handle TFs with index >= target_idx (assign 0.0)
+                    for tf_idx in range(target_idx, len(self.tf_names)):
+                        tf_name = self.tf_names[tf_idx]
+                        edge_scores[(tf_name, target_name)] = 0.0
+
+                except Exception as e:
+                    import warnings
+                    import traceback
+                    warnings.warn(f"Failed to extract edge scores for {target_name} with sequential_rollout: {e}\n{traceback.format_exc()}")
+                    for tf_name in self.tf_names:
+                        edge_scores[(tf_name, target_name)] = 0.0
+
+                continue
+
+            # Original strategies (self_attention, tf_to_target, etc.)
             try:
                 target_edge_scores = computer.compute(
                     attention,
