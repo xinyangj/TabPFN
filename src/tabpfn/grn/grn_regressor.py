@@ -760,8 +760,16 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         return graph
 
-    def get_edge_scores(self) -> dict[tuple[str, str], float]:
+    def get_edge_scores(self, edge_score_strategy: str | None = None) -> dict[tuple[str, str], float]:
         """Get edge scores from fitted model.
+
+        Parameters
+        ----------
+        edge_score_strategy : str, optional
+            Edge score strategy to use. If None, uses the strategy from __init__.
+            Options: 'self_attention', 'tf_to_target', 'target_to_tf', 'sequential_rollout',
+                     'gradient_rollout', 'combined', 'combined_best'
+            This allows computing different edge score strategies without re-fitting.
 
         Returns
         -------
@@ -775,7 +783,43 @@ class TabPFNGRNRegressor(BaseEstimator):
         """
         if not self.edge_scores_:
             raise ValueError("Model must be fitted before getting edge scores")
-        return self.edge_scores_
+
+        # If no strategy specified or same as init, return pre-computed scores
+        if edge_score_strategy is None or edge_score_strategy == self.edge_score_strategy:
+            return self.edge_scores_
+
+        # Otherwise, recompute with the new strategy
+        return self._compute_edge_scores_with_strategy(edge_score_strategy)
+
+    def _compute_edge_scores_with_strategy(self, edge_score_strategy: str) -> dict[tuple[str, str], float]:
+        """Compute edge scores from attention weights using a specific strategy.
+
+        This method allows recomputing edge scores with a different strategy
+        without re-fitting the model.
+
+        Parameters
+        ----------
+        edge_score_strategy : str
+            Edge score strategy to use
+            Options: 'self_attention', 'tf_to_target', 'target_to_tf', 'sequential_rollout',
+                     'gradient_rollout', 'combined', 'combined_best'
+
+        Returns
+        -------
+        edge_scores : dict
+            Dictionary mapping (tf, target) pairs to edge scores
+        """
+        # Temporarily override the strategy for computation
+        original_strategy = self.edge_score_strategy
+        self.edge_score_strategy = edge_score_strategy
+
+        try:
+            # Use the existing _compute_edge_scores method with the new strategy
+            edge_scores = self._compute_edge_scores()
+            return edge_scores
+        finally:
+            # Restore original strategy
+            self.edge_score_strategy = original_strategy
 
     def _create_cv_splits(
         self, X: npt.NDArray[np.float32]

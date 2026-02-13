@@ -152,13 +152,25 @@ class GRNPreprocessor:
         if not tf_indices:
             raise ValueError("No TFs found in gene_names")
         if not target_indices:
-            raise ValueError("No target genes found in gene_names")
+            # Edge case: All genes are TFs (e.g., DREAM4-10)
+            # In this case, use all TFs as targets (TF-TF regulation)
+            import warnings
+            warnings.warn(
+                "All genes are TFs. Using all TFs as targets for TF-TF regulation inference. "
+                "Note: When fitting models, each target will be excluded from its own input features.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            target_indices = tf_indices.copy()
 
         # Store for later use
-        self.tf_names_ = [gene_names[i] for i in tf_indices]
+        # IMPORTANT: Use the INPUT tf_names order, not gene_names order
+        # to preserve the caller's intended ordering
+        self.tf_names_ = [tf for tf in tf_names if tf in gene_names]
         self.target_names_ = [gene_names[i] for i in target_indices]
 
         # Extract TF and target expression
+        # First extract in gene_names order (using tf_indices)
         tf_expression = expression[:, tf_indices]
         target_expression = expression[:, target_indices]
 
@@ -166,8 +178,18 @@ class GRNPreprocessor:
         tf_expression_norm = self._normalize(tf_expression, fit=True, suffix="tf")
         target_expression_norm = self._normalize(target_expression, fit=True, suffix="target")
 
+        # REORDER tf_expression_norm to match INPUT tf_names order
+        # Create a mapping from gene name to its column index in tf_expression_norm
+        tf_name_to_col_idx = {gene_names[i]: j for j, i in enumerate(tf_indices)}
+
+        # Reorder columns to match input tf_names order
+        reordered_tf_expression = np.zeros_like(tf_expression_norm)
+        for j, tf_name in enumerate(self.tf_names_):
+            original_col_idx = tf_name_to_col_idx[tf_name]
+            reordered_tf_expression[:, j] = tf_expression_norm[:, original_col_idx]
+
         # Create feature matrix
-        X = tf_expression_norm
+        X = reordered_tf_expression
         if self.add_interaction_features:
             X = self._add_interaction_features(X)
 
