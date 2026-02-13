@@ -2,10 +2,27 @@
 
 Runs TabPFN GRN inference on DREAM datasets and compares against baseline methods.
 Generates a detailed performance report with metrics and visualizations.
+
+Usage:
+    # Run all datasets
+    python scripts/grn_performance_analysis.py
+
+    # Run only specific datasets
+    python scripts/grn_performance_analysis.py --datasets dream4-10 dream4-100
+
+    # Run with limited networks for faster testing
+    python scripts/grn_performance_analysis.py --datasets dream4-10 --max-networks 2
+
+    # Skip expression evaluation
+    python scripts/grn_performance_analysis.py --datasets dream4-10 --no-expression
+
+    # Limit number of targets in DREAM5
+    python scripts/grn_performance_analysis.py --datasets dream5 --max-targets 20
 """
 
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import tempfile
@@ -28,6 +45,7 @@ from tabpfn.grn import (
     EdgeScoreVisualizer,
     create_evaluation_summary_plot,
 )
+from tabpfn.grn.baseline_models import TabPFNWrapper
 
 
 def cleanup_gpu_memory() -> None:
@@ -54,66 +72,6 @@ def cleanup_gpu_memory() -> None:
 # ============================================================================
 # Wrapper Classes for Expression Prediction Evaluation
 # ============================================================================
-
-class TabPFNRegressorWrapper:
-    """Wrapper for TabPFNGRNRegressor to provide consistent predict() interface.
-
-    This wrapper converts TabPFN's dict output format to numpy array format
-    for compatibility with the expression evaluation framework.
-    """
-
-    def __init__(
-        self,
-        tf_names: list[str],
-        target_genes: list[str],
-        n_estimators: int = 1,
-        edge_score_strategy: str = "self_attention",
-    ):
-        from tabpfn.grn import TabPFNGRNRegressor
-
-        self.tf_names = tf_names
-        self.target_genes = target_genes
-        self.model = TabPFNGRNRegressor(
-            tf_names=tf_names,
-            target_genes=target_genes,
-            n_estimators=n_estimators,
-            edge_score_strategy=edge_score_strategy,
-        )
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "TabPFNRegressorWrapper":
-        """Fit the TabPFN GRN model.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            TF expression matrix (n_samples, n_TFs)
-        y : np.ndarray
-            Target expression matrix (n_samples, n_targets)
-
-        Returns
-        -------
-        self : TabPFNRegressorWrapper
-        """
-        self.model.fit(X, y)
-        return self
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict target gene expression.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            TF expression matrix (n_samples, n_TFs)
-
-        Returns
-        -------
-        predictions : np.ndarray
-            Predicted expression of shape (n_samples, n_targets)
-        """
-        pred_dict = self.model.predict(X)
-        # Convert dict to array: column_stack preserves order of target_genes
-        return np.column_stack([pred_dict[t] for t in self.target_genes])
-
 
 class GENIE3RegressorWrapper:
     """Wrapper for GENIE3 with fit/predict interface for expression evaluation.
@@ -352,6 +310,110 @@ class MutualInfoPredictorWrapper:
 # ============================================================================
 
 
+def evaluate_tabpfn_expression_prediction(
+    model: TabPFNWrapper,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    target_genes: list[str],
+    tf_names: list[str],
+) -> dict[str, float]:
+    """Evaluate TabPFN expression prediction with memory-efficient per-target processing.
+
+    Uses fit_one_target_gene() and predict_one_target_gene() in a single loop
+    to fit/predict one target at a time with cleanup to avoid OOM.
+
+    Parameters
+    ----------
+    model : TabPFNWrapper
+        The TabPFN wrapper instance
+    X_train : np.ndarray
+        Training TF expression matrix (n_samples, n_TFs)
+    y_train : np.ndarray
+        Training target expression matrix (n_samples, n_targets)
+    X_test : np.ndarray
+        Test TF expression matrix (n_samples, n_TFs)
+    y_test : np.ndarray
+        Test target expression matrix (n_samples, n_targets)
+    target_genes : list[str]
+        Target gene names
+    tf_names : list[str]
+        Transcription factor names
+
+    Returns
+    -------
+    metrics : dict
+        Dictionary with mean/std of MSE, RMSE, MAE, R², Pearson r
+    """
+    import gc
+    from tabpfn.grn.evaluation import compute_expression_metrics
+
+    # Set the necessary attributes that predict_one_target_gene() needs
+    model._tf_names = tf_names
+    model._target_genes = target_genes
+
+    # Initialize predictions array
+    y_pred = np.zeros_like(y_test)
+
+    # Fit, predict, and cleanup each target one at a time in a single loop
+    for target_idx, target_name in enumerate(target_genes):
+        y_target = y_train[:, target_idx]
+        model.fit_one_target_gene(
+            target_idx=target_idx,
+            target_name=target_name,
+            X_for_target=X_train,
+            y_target=y_target,
+            tf_names_for_target=tf_names,
+        )
+
+        # Predict for this target
+        prediction_result = model.predict_one_target_gene(
+            target_name=target_name,
+            X=X_test,
+            tf_names_for_target=tf_names,
+            cleanup_after=True,  # Cleanup after prediction
+        )
+
+        # predict_one_target_gene() returns a dict, extract the array
+        if isinstance(prediction_result, dict):
+            y_pred[:, target_idx] = prediction_result[target_name]
+        else:
+            y_pred[:, target_idx] = prediction_result
+
+        # Force cleanup after each target
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Compute metrics per target
+    target_metrics = {}
+    for i, target in enumerate(target_genes):
+        target_metrics[target] = compute_expression_metrics(
+            y_test[:, i], y_pred[:, i]
+        )
+
+    # Aggregate (mean and std across targets)
+    aggregated = {}
+    for metric in ["mse", "rmse", "mae", "r2", "pearson_r"]:
+        values = [tm[metric] for tm in target_metrics.values()]
+        aggregated[f"mean_{metric}"] = float(np.mean(values))
+        aggregated[f"std_{metric}"] = float(np.std(values))
+
+    # Final cleanup: Clear any remaining regressors from the wrapper
+    # This ensures all GPU tensors are released
+    if hasattr(model, '_regressors') and model._regressors:
+        for target_name in list(model._regressors.keys()):
+            if model._regressors[target_name] is not None:
+                model._regressors[target_name].cleanup_model()
+                del model._regressors[target_name]
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return aggregated
+
+
 def evaluate_expression_accuracy(
     X: np.ndarray,
     y: np.ndarray,
@@ -412,25 +474,35 @@ def evaluate_expression_accuracy(
     print(f"    Training samples: {X_train.shape[0]}")
     print(f"    Test samples: {X_test.shape[0]}")
 
-    # Handle TabPFN wrapper which needs tf_names and target_genes
-    if "TabPFNRegressorWrapper" in str(model_class):
-        # Extract TabPFN-specific kwargs
+    # Handle TabPFN - use TabPFNWrapper directly from baseline_models
+    if "TabPFN" in str(model_class):
         n_estimators = model_kwargs.pop("n_estimators", 1)
         edge_score_strategy = model_kwargs.pop("edge_score_strategy", "self_attention")
-        model = model_class(
-            tf_names=tf_names,
-            target_genes=target_genes,
+
+        model = TabPFNWrapper(
             n_estimators=n_estimators,
+            attention_aggregation="mean",
             edge_score_strategy=edge_score_strategy,
+            device="auto",
+            random_state=42,
+            keep_model=True,  # Keep model for expression prediction, cleanup after each predict
         )
     else:
         model = model_class(**model_kwargs)
 
     # Train and evaluate
     start_time = time.time()
-    metrics = evaluate_expression_prediction(
-        model, X_train, y_train, X_test, y_test, target_genes
-    )
+
+    # Special handling for TabPFNWrapper - use per-target methods
+    if isinstance(model, TabPFNWrapper):
+        metrics = evaluate_tabpfn_expression_prediction(
+            model, X_train, y_train, X_test, y_test, target_genes, tf_names
+        )
+    else:
+        metrics = evaluate_expression_prediction(
+            model, X_train, y_train, X_test, y_test, target_genes
+        )
+
     eval_time = time.time() - start_time
 
     # Add metadata
@@ -744,8 +816,99 @@ def generate_comparison_report(
     print(f"{'='*80}")
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for dataset selection.
+
+    Returns
+    -------
+    args : argparse.Namespace
+        Parsed arguments with dataset options
+    """
+    parser = argparse.ArgumentParser(
+        description="GRN Performance Analysis - Compare TabPFN with baseline methods",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                                    # Run all datasets
+  %(prog)s --datasets dream4-10 dream4-100    # Run only specific datasets
+  %(prog)s --datasets dream4-10 --max-networks 2  # Limit networks for speed
+  %(prog)s --datasets dream5 --max-targets 20     # Limit DREAM5 targets
+  %(prog)s --no-expression --no-baselines        # Skip expression/baseline evaluation
+        """
+    )
+
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=["dream4-10", "dream4-100", "dream5"],
+        default=None,
+        help="Datasets to run (default: all). Options: dream4-10, dream4-100, dream5"
+    )
+
+    parser.add_argument(
+        "--max-networks",
+        type=int,
+        default=None,
+        help="Maximum number of networks to process for DREAM4 (default: all 5 for 10-gene, 1 for 100-gene)"
+    )
+
+    parser.add_argument(
+        "--network-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Specific network IDs to run for DREAM4 (1-indexed, e.g., --network-ids 1 3 5)"
+    )
+
+    parser.add_argument(
+        "--max-targets",
+        type=int,
+        default=30,
+        help="Maximum number of target genes for DREAM5 (default: 30)"
+    )
+
+    parser.add_argument(
+        "--no-expression",
+        action="store_true",
+        help="Skip expression prediction accuracy evaluation"
+    )
+
+    parser.add_argument(
+        "--no-baselines",
+        action="store_true",
+        help="Skip baseline methods (correlation, MI, GENIE3, GRNBoost2)"
+    )
+
+    parser.add_argument(
+        "--strategies",
+        nargs="+",
+        choices=["self_attention", "tf_to_target", "target_to_tf", "combined",
+                 "combined_best", "sequential_rollout", "gradient_rollout"],
+        default=None,
+        help="TabPFN edge score strategies to test (default: all 7 strategies)"
+    )
+
+    parser.add_argument(
+        "--n-estimators",
+        type=int,
+        default=1,
+        help="Number of TabPFN estimators (default: 1)"
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for results (default: results/grn_analysis)"
+    )
+
+    return parser.parse_args()
+
+
 def main() -> None:
     """Run comprehensive GRN performance analysis."""
+    args = parse_args()
+
     print("=" * 80)
     print("GRN PERFORMANCE ANALYSIS - TabPFN vs Baselines")
     print("=" * 80)
@@ -757,37 +920,65 @@ def main() -> None:
     dream4_path = project_root / "data" / "dream4"
     dream5_path = project_root / "data" / "dream5"
     output_dir = project_root / "results" / "grn_analysis"
+    if args.output_dir:
+        output_dir = project_root / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine which datasets to run
+    datasets_to_run = args.datasets
+    if datasets_to_run is None:
+        # Default: run all datasets
+        datasets_to_run = ["dream4-10", "dream4-100", "dream5"]
+
+    # Define TabPFN edge score strategies to test
+    tabpfn_strategies = args.strategies
+    if tabpfn_strategies is None:
+        tabpfn_strategies = [
+            "self_attention",
+            "tf_to_target",
+            "target_to_tf",
+            "combined",
+            "combined_best",
+            "sequential_rollout",  # Unified attention rollout
+            "gradient_rollout",    # Gradient-weighted attention rollout
+        ]
+
+    # Print configuration
+    print(f"\nConfiguration:")
+    print(f"  Datasets: {', '.join(datasets_to_run)}")
+    print(f"  TabPFN strategies: {len(tabpfn_strategies)} strategies")
+    print(f"  Expression evaluation: {'Disabled' if args.no_expression else 'Enabled'}")
+    print(f"  Baseline methods: {'Disabled' if args.no_baselines else 'Enabled'}")
+    print(f"  Estimators: {args.n_estimators}")
+    print(f"  Output directory: {output_dir}")
 
     all_results = []
     all_expression_results = []  # Collect all expression accuracy results
 
-    # Define TabPFN edge score strategies to test
-    tabpfn_strategies = [
-        "self_attention",
-        "tf_to_target",
-        "target_to_tf",
-        "combined",
-        "combined_best",
-        "sequential_rollout",  # Unified attention rollout
-        "gradient_rollout",    # NEW: Gradient-weighted attention rollout (GMAR-inspired)
-    ]
-
     # ============================================================================
     # DREAM4 Analysis (10 genes - fast for testing)
     # ============================================================================
-    print("\n" + "="*80)
-    print("DREAM4 ANALYSIS (10 genes, 5 networks)")
-    print("="*80)
+    if "dream4-10" in datasets_to_run:
+        print("\n" + "="*80)
+        print("DREAM4 ANALYSIS (10 genes, 5 networks)")
+        print("="*80)
 
-    # Create loader for DREAM4 data
-    dream4_loader = DREAMChallengeLoader(data_path=str(dream4_path))
+        # Create loader for DREAM4 data
+        dream4_loader = DREAMChallengeLoader(data_path=str(dream4_path))
 
-    for network_id in range(1, 3):  # Test 2 networks for speed
-        expression, gene_names, tf_names, gold_standard = dream4_loader.load_dream4(
-            network_size=10,
-            network_id=network_id
-        )
+        # Determine network IDs to run
+        if args.network_ids:
+            network_ids_to_run = args.network_ids
+        elif args.max_networks:
+            network_ids_to_run = range(1, min(args.max_networks + 1, 6))
+        else:
+            network_ids_to_run = range(1, 3)  # Default: 2 networks for speed
+
+        for network_id in network_ids_to_run:
+            expression, gene_names, tf_names, gold_standard = dream4_loader.load_dream4(
+                network_size=10,
+                network_id=network_id
+            )
 
         preprocessor = GRNPreprocessor(normalization="zscore")
         X, y, tf_indices, target_indices = preprocessor.fit_transform(
@@ -798,370 +989,401 @@ def main() -> None:
         dataset_name = f"DREAM4_10_{network_id}"
 
         # Run TabPFN with all strategies using unified runner
+        # NEW: Use run_tabpfn_multiple_strategies() to fit ONCE and compute all strategies
         baseline_runner = GRNBaselineRunner(normalization="zscore")
 
-        for strategy in tabpfn_strategies:
+        print(f"\n{'='*70}")
+        print(f"TabPFN GRN Analysis: {dataset_name} (ALL STRATEGIES)")
+        print(f"{'='*70}")
+        print(f"  Running {len(tabpfn_strategies)} strategies with single fit...")
+
+        # Fit once, compute all strategies
+        tabpfn_results = baseline_runner.run_tabpfn_multiple_strategies(
+            expression=expression,
+            gene_names=gene_names,
+            tf_names=tf_names,
+            gold_standard=gold_standard,
+            dataset_name=dataset_name,
+            n_estimators=args.n_estimators,
+            attention_aggregation="mean",
+            edge_score_strategies=tabpfn_strategies,
+        )
+
+        # Add all results
+        for strategy, result in tabpfn_results.items():
+            all_results.append(result)
             strategy_label = strategy.replace("_", " ").title()
-            print(f"\n{'='*70}")
-            print(f"TabPFN GRN Analysis: {dataset_name} ({strategy_label})")
-            print(f"{'='*70}")
-            print(f"  Strategy: {strategy}")
+            print(f"  {strategy_label}: AUPR={result['metrics']['aupr']:.4f}, AUROC={result['metrics']['auroc']:.4f}")
 
-            result_tabpfn = baseline_runner.run_method(
-                method="tabpfn",
-                expression=expression,
-                gene_names=gene_names,
-                tf_names=tf_names,
-                gold_standard=gold_standard,
-                dataset_name=dataset_name,
-                n_estimators=1,
-                attention_aggregation="mean",
-                edge_score_strategy=strategy,
-            )
-            all_results.append(result_tabpfn)
-            # Clean up GPU memory after each strategy
-            cleanup_gpu_memory()
+        # Clean up GPU memory after all strategies
+        cleanup_gpu_memory()
 
-        for method in ["correlation", "mutual_info", "genie3", "grnboost2"]:
-            result = baseline_runner.run_method(
-                method=method,
-                expression=expression,
-                gene_names=gene_names,
-                tf_names=tf_names,
-                gold_standard=gold_standard,
-                dataset_name=dataset_name,
-            )
-            if result is not None:
-                all_results.append(result)
+        # Run baseline methods if enabled
+        if not args.no_baselines:
+            for method in ["correlation", "mutual_info", "genie3", "grnboost2"]:
+                result = baseline_runner.run_method(
+                    method=method,
+                    expression=expression,
+                    gene_names=gene_names,
+                    tf_names=tf_names,
+                    gold_standard=gold_standard,
+                    dataset_name=dataset_name,
+                )
+                if result is not None:
+                    all_results.append(result)
 
         # Expression Prediction Accuracy Evaluation (per network)
-        print(f"\n{'='*80}")
-        print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-10, network {network_id})")
-        print(f"{'='*80}")
+        if not args.no_expression:
+            print(f"\n{'='*80}")
+            print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-10, network {network_id})")
+            print(f"{'='*80}")
 
-        # Note: All TabPFN strategies produce identical predictions (edge strategy only affects edge extraction)
-        # So we only test one strategy for expression prediction
-        result_tabpfn_expr = evaluate_expression_accuracy(
-            X, y, tf_names, target_genes,
-            model_class=TabPFNRegressorWrapper,
-            model_kwargs={
-                "n_estimators": 1,
-                "edge_score_strategy": "self_attention"
-            },
-            method_name="TabPFN"
-        )
-        result_tabpfn_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
-        all_expression_results.append(result_tabpfn_expr)
+            # Note: All TabPFN strategies produce identical predictions (edge strategy only affects edge extraction)
+            # So we only test one strategy for expression prediction
+            result_tabpfn_expr = evaluate_expression_accuracy(
+                X, y, tf_names, target_genes,
+                model_class=TabPFNWrapper,
+                model_kwargs={
+                    "n_estimators": args.n_estimators,
+                    "edge_score_strategy": "self_attention"
+                },
+                method_name="TabPFN"
+            )
+            result_tabpfn_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
+            all_expression_results.append(result_tabpfn_expr)
 
-        # GENIE3
-        result_genie3_expr = evaluate_expression_accuracy(
-            X, y, tf_names, target_genes,
-            model_class=GENIE3RegressorWrapper,
-            model_kwargs={"n_estimators": 50},
-            method_name="GENIE3"
-        )
-        result_genie3_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
-        all_expression_results.append(result_genie3_expr)
+            if not args.no_baselines:
+                # GENIE3
+                result_genie3_expr = evaluate_expression_accuracy(
+                    X, y, tf_names, target_genes,
+                    model_class=GENIE3RegressorWrapper,
+                    model_kwargs={"n_estimators": 50},
+                    method_name="GENIE3"
+                )
+                result_genie3_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
+                all_expression_results.append(result_genie3_expr)
 
-        # GRNBoost2
-        result_grnboost2_expr = evaluate_expression_accuracy(
-            X, y, tf_names, target_genes,
-            model_class=GRNBoost2RegressorWrapper,
-            model_kwargs={"n_estimators": 50},
-            method_name="GRNBoost2"
-        )
-        result_grnboost2_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
-        all_expression_results.append(result_grnboost2_expr)
+                # GRNBoost2
+                result_grnboost2_expr = evaluate_expression_accuracy(
+                    X, y, tf_names, target_genes,
+                    model_class=GRNBoost2RegressorWrapper,
+                    model_kwargs={"n_estimators": 50},
+                    method_name="GRNBoost2"
+                )
+                result_grnboost2_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
+                all_expression_results.append(result_grnboost2_expr)
 
-        # Linear Regression (represents both Correlation and MI - both use LR for prediction)
-        result_lr_expr = evaluate_expression_accuracy(
-            X, y, tf_names, target_genes,
-            model_class=CorrelationPredictorWrapper,
-            model_kwargs={},
-            method_name="Linear Regression"
-        )
-        result_lr_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
-        all_expression_results.append(result_lr_expr)
+                # Linear Regression (represents both Correlation and MI - both use LR for prediction)
+                result_lr_expr = evaluate_expression_accuracy(
+                    X, y, tf_names, target_genes,
+                    model_class=CorrelationPredictorWrapper,
+                    model_kwargs={},
+                    method_name="Linear Regression"
+                )
+                result_lr_expr["dataset"] = f"DREAM4_10_{network_id}_Expr"
+                all_expression_results.append(result_lr_expr)
 
     # ============================================================================
     # DREAM4 Analysis (100 genes - larger test)
     # ============================================================================
-    print("\n" + "="*80)
-    print("DREAM4 ANALYSIS (100 genes)")
-    print("="*80)
+    if "dream4-100" in datasets_to_run:
+        print("\n" + "="*80)
+        print("DREAM4 ANALYSIS (100 genes)")
+        print("="*80)
 
-    expression, gene_names, tf_names, gold_standard = dream4_loader.load_dream4(
-        network_size=100,
-        network_id=1
-    )
+        # Create loader for DREAM4 data (if not already created)
+        if 'dream4_loader' not in locals():
+            dream4_loader = DREAMChallengeLoader(data_path=str(dream4_path))
 
-    preprocessor = GRNPreprocessor(normalization="zscore")
-    X, y, tf_indices, target_indices = preprocessor.fit_transform(
-        expression, gene_names, tf_names
-    )
-    target_genes = preprocessor.get_target_names()
+        expression, gene_names, tf_names, gold_standard = dream4_loader.load_dream4(
+            network_size=100,
+            network_id=1
+        )
 
-    dataset_name = "DREAM4_100_1"
+        preprocessor = GRNPreprocessor(normalization="zscore")
+        X, y, tf_indices, target_indices = preprocessor.fit_transform(
+            expression, gene_names, tf_names
+        )
+        target_genes = preprocessor.get_target_names()
 
-    # Run TabPFN with all strategies using unified runner
-    baseline_runner = GRNBaselineRunner(normalization="zscore")
+        dataset_name = "DREAM4_100_1"
 
-    for strategy in tabpfn_strategies:
-        strategy_label = strategy.replace("_", " ").title()
+        # Run TabPFN with all strategies using unified runner
+        # NEW: Use run_tabpfn_multiple_strategies() to fit ONCE and compute all strategies
+        baseline_runner = GRNBaselineRunner(normalization="zscore")
+
         print(f"\n{'='*70}")
-        print(f"TabPFN GRN Analysis: {dataset_name} ({strategy_label})")
+        print(f"TabPFN GRN Analysis: {dataset_name} (ALL STRATEGIES)")
         print(f"{'='*70}")
-        print(f"  Strategy: {strategy}")
+        print(f"  Running {len(tabpfn_strategies)} strategies with single fit...")
 
-        result_tabpfn = baseline_runner.run_method(
-            method="tabpfn",
+        # Fit once, compute all strategies
+        tabpfn_results = baseline_runner.run_tabpfn_multiple_strategies(
             expression=expression,
             gene_names=gene_names,
             tf_names=tf_names,
             gold_standard=gold_standard,
             dataset_name=dataset_name,
-            n_estimators=1,
+            n_estimators=args.n_estimators,
             attention_aggregation="mean",
-            edge_score_strategy=strategy,
+            edge_score_strategies=tabpfn_strategies,
         )
-        all_results.append(result_tabpfn)
-        # Clean up GPU memory after each strategy
+
+        # Add all results
+        for strategy, result in tabpfn_results.items():
+            all_results.append(result)
+            strategy_label = strategy.replace("_", " ").title()
+            print(f"  {strategy_label}: AUPR={result['metrics']['aupr']:.4f}, AUROC={result['metrics']['auroc']:.4f}")
+
+        # Clean up GPU memory after all strategies
         cleanup_gpu_memory()
 
-    for method in ["correlation", "mutual_info", "genie3", "grnboost2"]:
-        result = baseline_runner.run_method(
-            method=method,
-            expression=expression,
-            gene_names=gene_names,
-            tf_names=tf_names,
-            gold_standard=gold_standard,
-            dataset_name=dataset_name,
-        )
-        if result is not None:
-            all_results.append(result)
+        # Run baseline methods if enabled
+        if not args.no_baselines:
+            for method in ["correlation", "mutual_info", "genie3", "grnboost2"]:
+                result = baseline_runner.run_method(
+                    method=method,
+                    expression=expression,
+                    gene_names=gene_names,
+                    tf_names=tf_names,
+                    gold_standard=gold_standard,
+                    dataset_name=dataset_name,
+                )
+                if result is not None:
+                    all_results.append(result)
 
-    # Expression Prediction Accuracy Evaluation (DREAM4-100)
-    print(f"\n{'='*80}")
-    print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-100)")
-    print(f"{'='*80}")
+        # Expression Prediction Accuracy Evaluation (DREAM4-100)
+        if not args.no_expression:
+            print(f"\n{'='*80}")
+            print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM4-100)")
+            print(f"{'='*80}")
 
-    # TabPFN (only one strategy needed - all produce identical predictions)
-    result_tabpfn_expr = evaluate_expression_accuracy(
-        X, y, tf_names, target_genes,
-        model_class=TabPFNRegressorWrapper,
-        model_kwargs={
-            "n_estimators": 1,
-            "edge_score_strategy": "self_attention"
-        },
-        method_name="TabPFN"
-    )
-    result_tabpfn_expr["dataset"] = "DREAM4_100_Expr"
-    all_expression_results.append(result_tabpfn_expr)
+            # TabPFN (only one strategy needed - all produce identical predictions)
+            result_tabpfn_expr = evaluate_expression_accuracy(
+                X, y, tf_names, target_genes,
+                model_class=TabPFNWrapper,
+                model_kwargs={
+                    "n_estimators": args.n_estimators,
+                    "edge_score_strategy": "self_attention"
+                },
+                method_name="TabPFN"
+            )
+            result_tabpfn_expr["dataset"] = "DREAM4_100_Expr"
+            all_expression_results.append(result_tabpfn_expr)
 
-    # GENIE3
-    result_genie3_expr = evaluate_expression_accuracy(
-        X, y, tf_names, target_genes,
-        model_class=GENIE3RegressorWrapper,
-        model_kwargs={"n_estimators": 50},
-        method_name="GENIE3"
-    )
-    result_genie3_expr["dataset"] = "DREAM4_100_Expr"
-    all_expression_results.append(result_genie3_expr)
+            if not args.no_baselines:
+                # GENIE3
+                result_genie3_expr = evaluate_expression_accuracy(
+                    X, y, tf_names, target_genes,
+                    model_class=GENIE3RegressorWrapper,
+                    model_kwargs={"n_estimators": 50},
+                    method_name="GENIE3"
+                )
+                result_genie3_expr["dataset"] = "DREAM4_100_Expr"
+                all_expression_results.append(result_genie3_expr)
 
-    # GRNBoost2
-    result_grnboost2_expr = evaluate_expression_accuracy(
-        X, y, tf_names, target_genes,
-        model_class=GRNBoost2RegressorWrapper,
-        model_kwargs={"n_estimators": 50},
-        method_name="GRNBoost2"
-    )
-    result_grnboost2_expr["dataset"] = "DREAM4_100_Expr"
-    all_expression_results.append(result_grnboost2_expr)
+                # GRNBoost2
+                result_grnboost2_expr = evaluate_expression_accuracy(
+                    X, y, tf_names, target_genes,
+                    model_class=GRNBoost2RegressorWrapper,
+                    model_kwargs={"n_estimators": 50},
+                    method_name="GRNBoost2"
+                )
+                result_grnboost2_expr["dataset"] = "DREAM4_100_Expr"
+                all_expression_results.append(result_grnboost2_expr)
 
-    # Linear Regression (represents both Correlation and MI)
-    result_lr_expr = evaluate_expression_accuracy(
-        X, y, tf_names, target_genes,
-        model_class=CorrelationPredictorWrapper,
-        model_kwargs={},
-        method_name="Linear Regression"
-    )
-    result_lr_expr["dataset"] = "DREAM4_100_Expr"
-    all_expression_results.append(result_lr_expr)
+                # Linear Regression (represents both Correlation and MI)
+                result_lr_expr = evaluate_expression_accuracy(
+                    X, y, tf_names, target_genes,
+                    model_class=CorrelationPredictorWrapper,
+                    model_kwargs={},
+                    method_name="Linear Regression"
+                )
+                result_lr_expr["dataset"] = "DREAM4_100_Expr"
+                all_expression_results.append(result_lr_expr)
 
     # ============================================================================
     # DREAM5 E. coli Analysis (real data)
     # ============================================================================
-    print("\n" + "="*80)
-    print("DREAM5 E. COLI ANALYSIS (real data)")
-    print("="*80)
+    if "dream5" in datasets_to_run:
+        print("\n" + "="*80)
+        print("DREAM5 E. COLI ANALYSIS (real data)")
+        print("="*80)
 
-    # Clean up GPU memory before starting DREAM5 (largest dataset)
-    print("Cleaning up GPU memory before DREAM5 analysis...")
-    cleanup_gpu_memory()
+        # Clean up GPU memory before starting DREAM5 (largest dataset)
+        print("Cleaning up GPU memory before DREAM5 analysis...")
+        cleanup_gpu_memory()
 
-    try:
-        import pandas as pd
+        try:
+            import pandas as pd
 
-        # Create loader for DREAM5 data
-        dream5_loader = DREAMChallengeLoader(data_path=str(dream5_path))
+            # Create loader for DREAM5 data
+            dream5_loader = DREAMChallengeLoader(data_path=str(dream5_path))
 
-        expression, gene_names, tf_names, gold_standard = dream5_loader.load_dream5_ecoli()
+            expression, gene_names, tf_names, gold_standard = dream5_loader.load_dream5_ecoli()
 
-        # Convert gold_standard DataFrame to set if needed
-        if isinstance(gold_standard, pd.DataFrame):
-            gs_set = set()
-            for _, row in gold_standard.iterrows():
-                # Handle different column name formats
-                if "tf" in row and "target" in row:
-                    gs_set.add((row["tf"], row["target"]))
-                elif "TF" in row and "Target" in row:
-                    gs_set.add((row["TF"], row["Target"]))
-                elif "source" in row and "target" in row:
-                    gs_set.add((row["source"], row["target"]))
-                elif len(row) >= 2:
-                    # Assume first two columns are TF and target
-                    gs_set.add((row.iloc[0], row.iloc[1]))
-            gold_standard = gs_set
+            # Convert gold_standard DataFrame to set if needed
+            if isinstance(gold_standard, pd.DataFrame):
+                gs_set = set()
+                for _, row in gold_standard.iterrows():
+                    # Handle different column name formats
+                    if "tf" in row and "target" in row:
+                        gs_set.add((row["tf"], row["target"]))
+                    elif "TF" in row and "Target" in row:
+                        gs_set.add((row["TF"], row["Target"]))
+                    elif "source" in row and "target" in row:
+                        gs_set.add((row["source"], row["target"]))
+                    elif len(row) >= 2:
+                        # Assume first two columns are TF and target
+                        gs_set.add((row.iloc[0], row.iloc[1]))
+                gold_standard = gs_set
 
-        # For DREAM5, filter to only genes in gold standard for efficiency
-        gold_genes = set()
-        for tf, tgt in gold_standard:
-            gold_genes.add(tf)
-            gold_genes.add(tgt)
+            # For DREAM5, filter to only genes in gold standard for efficiency
+            gold_genes = set()
+            for tf, tgt in gold_standard:
+                gold_genes.add(tf)
+                gold_genes.add(tgt)
 
-        # Filter expression to gold standard genes only
-        gold_gene_list = list(gold_genes & set(gene_names))
-        gene_idx_map = {g: i for i, g in enumerate(gene_names)}
-        gold_indices = [gene_idx_map[g] for g in gold_gene_list]
+            # Filter expression to gold standard genes only
+            gold_gene_list = list(gold_genes & set(gene_names))
+            gene_idx_map = {g: i for i, g in enumerate(gene_names)}
+            gold_indices = [gene_idx_map[g] for g in gold_gene_list]
 
-        expression_filtered = expression[:, gold_indices]
-        gene_names_filtered = gold_gene_list
+            expression_filtered = expression[:, gold_indices]
+            gene_names_filtered = gold_gene_list
 
-        # Update TF list to only include TFs in filtered genes
-        tf_names_filtered = [tf for tf in tf_names if tf in gold_gene_list]
+            # Update TF list to only include TFs in filtered genes
+            tf_names_filtered = [tf for tf in tf_names if tf in gold_gene_list]
 
-        preprocessor = GRNPreprocessor(normalization="zscore")
-        X, y, tf_indices, target_indices = preprocessor.fit_transform(
-            expression_filtered, gene_names_filtered, tf_names_filtered
-        )
-        all_target_genes = preprocessor.get_target_names()
+            preprocessor = GRNPreprocessor(normalization="zscore")
+            X, y, tf_indices, target_indices = preprocessor.fit_transform(
+                expression_filtered, gene_names_filtered, tf_names_filtered
+            )
+            all_target_genes = preprocessor.get_target_names()
 
-        # Limit to first 30 targets for speed
-        target_genes = all_target_genes[:30]
+            # Limit to user-specified number of targets for speed
+            target_genes = all_target_genes[:args.max_targets]
 
-        # Filter expression to only include selected targets and all TFs
-        target_indices_selected = [i for i, tgt in enumerate(all_target_genes) if tgt in target_genes]
-        y_subset = y[:, target_indices_selected]
+            # Filter expression to only include selected targets and all TFs
+            target_indices_selected = [i for i, tgt in enumerate(all_target_genes) if tgt in target_genes]
+            y_subset = y[:, target_indices_selected]
 
-        # Also filter gold_standard to only include our subset of targets
-        filtered_gold_standard = {
-            (tf, tgt) for tf, tgt in gold_standard
-            if tgt in target_genes and tf in tf_names_filtered
-        }
+            # Also filter gold_standard to only include our subset of targets
+            filtered_gold_standard = {
+                (tf, tgt) for tf, tgt in gold_standard
+                if tgt in target_genes and tf in tf_names_filtered
+            }
 
-        dataset_name = "DREAM5_Ecoli_subset"
+            dataset_name = "DREAM5_Ecoli_subset"
 
-        # Need to create expression matrix with only TFs + selected targets
-        # Do this BEFORE the TabPFN loop since these variables are used there
-        tf_indices_filtered = [gene_names_filtered.index(tf) for tf in tf_names_filtered]
-        target_indices_filtered = [gene_names_filtered.index(tgt) for tgt in target_genes]
+            # Need to create expression matrix with only TFs + selected targets
+            # Do this BEFORE the TabPFN loop since these variables are used there
+            tf_indices_filtered = [gene_names_filtered.index(tf) for tf in tf_names_filtered]
+            target_indices_filtered = [gene_names_filtered.index(tgt) for tgt in target_genes]
 
-        expression_for_baseline = expression_filtered[:, tf_indices_filtered + target_indices_filtered]
-        gene_names_for_baseline = tf_names_filtered + target_genes
+            expression_for_baseline = expression_filtered[:, tf_indices_filtered + target_indices_filtered]
+            gene_names_for_baseline = tf_names_filtered + target_genes
 
-        # Run TabPFN with all 7 strategies using unified runner
-        baseline_runner = GRNBaselineRunner(normalization="zscore")
+            # Run TabPFN with all strategies using unified runner
+            # NEW: Use run_tabpfn_multiple_strategies() to fit ONCE and compute all strategies
+            baseline_runner = GRNBaselineRunner(normalization="zscore")
 
-        for strategy in tabpfn_strategies:
-            strategy_label = strategy.replace("_", " ").title()
             print(f"\n{'='*70}")
-            print(f"TabPFN GRN Analysis: {dataset_name} ({strategy_label})")
+            print(f"TabPFN GRN Analysis: {dataset_name} (ALL STRATEGIES)")
             print(f"{'='*70}")
-            print(f"  Strategy: {strategy}")
+            print(f"  Running {len(tabpfn_strategies)} strategies with single fit...")
 
-            result_tabpfn = baseline_runner.run_method(
-                method="tabpfn",
+            # Fit once, compute all strategies
+            tabpfn_results = baseline_runner.run_tabpfn_multiple_strategies(
                 expression=expression_for_baseline,
                 gene_names=gene_names_for_baseline,
                 tf_names=tf_names_filtered,
                 gold_standard=filtered_gold_standard,
                 dataset_name=dataset_name,
                 target_genes=target_genes,
-                n_estimators=1,
+                n_estimators=args.n_estimators,
                 attention_aggregation="mean",
-                edge_score_strategy=strategy,
+                edge_score_strategies=tabpfn_strategies,
             )
-            all_results.append(result_tabpfn)
-            # Clean up GPU memory after each strategy (critical for DREAM5)
-            cleanup_gpu_memory()
 
-        # Run baseline methods using unified runner
-
-        for method in ["correlation", "mutual_info", "genie3", "grnboost2"]:
-            result = baseline_runner.run_method(
-                method=method,
-                expression=expression_for_baseline,
-                gene_names=gene_names_for_baseline,
-                tf_names=tf_names_filtered,
-                gold_standard=filtered_gold_standard,
-                dataset_name=dataset_name,
-            )
-            if result is not None:
+            # Add all results
+            for strategy, result in tabpfn_results.items():
                 all_results.append(result)
+                strategy_label = strategy.replace("_", " ").title()
+                print(f"  {strategy_label}: AUPR={result['metrics']['aupr']:.4f}, AUROC={result['metrics']['auroc']:.4f}")
+
+            # Clean up GPU memory after all strategies (critical for DREAM5)
             cleanup_gpu_memory()
-        cleanup_gpu_memory()
 
-        # Expression Prediction Accuracy Evaluation (DREAM5)
-        print(f"\n{'='*80}")
-        print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM5 E. coli)")
-        print(f"{'='*80}")
+            # Run baseline methods using unified runner
+            if not args.no_baselines:
+                for method in ["correlation", "mutual_info", "genie3", "grnboost2"]:
+                    result = baseline_runner.run_method(
+                        method=method,
+                        expression=expression_for_baseline,
+                        gene_names=gene_names_for_baseline,
+                        tf_names=tf_names_filtered,
+                        gold_standard=filtered_gold_standard,
+                        dataset_name=dataset_name,
+                    )
+                    if result is not None:
+                        all_results.append(result)
+                    cleanup_gpu_memory()
+            cleanup_gpu_memory()
 
-        # TabPFN (only one strategy needed)
-        result_tabpfn_expr = evaluate_expression_accuracy(
-            X, y_subset, tf_names_filtered, target_genes,
-            model_class=TabPFNRegressorWrapper,
-            model_kwargs={
-                "n_estimators": 1,
-                "edge_score_strategy": "self_attention"
-            },
-            method_name="TabPFN"
-        )
-        result_tabpfn_expr["dataset"] = "DREAM5_Ecoli_Expr"
-        all_expression_results.append(result_tabpfn_expr)
+            # Expression Prediction Accuracy Evaluation (DREAM5)
+            if not args.no_expression:
+                print(f"\n{'='*80}")
+                print(f"EXPRESSION PREDICTION ACCURACY EVALUATION (DREAM5 E. coli)")
+                print(f"{'='*80}")
 
-        # GENIE3
-        result_genie3_expr = evaluate_expression_accuracy(
-            X, y_subset, tf_names_filtered, target_genes,
-            model_class=GENIE3RegressorWrapper,
-            model_kwargs={"n_estimators": 50},
-            method_name="GENIE3"
-        )
-        result_genie3_expr["dataset"] = "DREAM5_Ecoli_Expr"
-        all_expression_results.append(result_genie3_expr)
+                # TabPFN (only one strategy needed)
+                result_tabpfn_expr = evaluate_expression_accuracy(
+                    X, y_subset, tf_names_filtered, target_genes,
+                    model_class=TabPFNWrapper,
+                    model_kwargs={
+                        "n_estimators": args.n_estimators,
+                        "edge_score_strategy": "self_attention"
+                    },
+                    method_name="TabPFN"
+                )
+                result_tabpfn_expr["dataset"] = "DREAM5_Ecoli_Expr"
+                all_expression_results.append(result_tabpfn_expr)
 
-        # GRNBoost2
-        result_grnboost2_expr = evaluate_expression_accuracy(
-            X, y_subset, tf_names_filtered, target_genes,
-            model_class=GRNBoost2RegressorWrapper,
-            model_kwargs={"n_estimators": 50},
-            method_name="GRNBoost2"
-        )
-        result_grnboost2_expr["dataset"] = "DREAM5_Ecoli_Expr"
-        all_expression_results.append(result_grnboost2_expr)
+                if not args.no_baselines:
+                    # GENIE3
+                    result_genie3_expr = evaluate_expression_accuracy(
+                        X, y_subset, tf_names_filtered, target_genes,
+                        model_class=GENIE3RegressorWrapper,
+                        model_kwargs={"n_estimators": 50},
+                        method_name="GENIE3"
+                    )
+                    result_genie3_expr["dataset"] = "DREAM5_Ecoli_Expr"
+                    all_expression_results.append(result_genie3_expr)
 
-        # Linear Regression (represents both Correlation and MI)
-        result_lr_expr = evaluate_expression_accuracy(
-            X, y_subset, tf_names_filtered, target_genes,
-            model_class=CorrelationPredictorWrapper,
-            model_kwargs={},
-            method_name="Linear Regression"
-        )
-        result_lr_expr["dataset"] = "DREAM5_Ecoli_Expr"
-        all_expression_results.append(result_lr_expr)
-    except Exception as e:
-        import traceback
-        print(f"DREAM5 E. coli analysis skipped: {e}")
-        traceback.print_exc()
+                    # GRNBoost2
+                    result_grnboost2_expr = evaluate_expression_accuracy(
+                        X, y_subset, tf_names_filtered, target_genes,
+                        model_class=GRNBoost2RegressorWrapper,
+                        model_kwargs={"n_estimators": 50},
+                        method_name="GRNBoost2"
+                    )
+                    result_grnboost2_expr["dataset"] = "DREAM5_Ecoli_Expr"
+                    all_expression_results.append(result_grnboost2_expr)
+
+                    # Linear Regression (represents both Correlation and MI)
+                    result_lr_expr = evaluate_expression_accuracy(
+                        X, y_subset, tf_names_filtered, target_genes,
+                        model_class=CorrelationPredictorWrapper,
+                        model_kwargs={},
+                        method_name="Linear Regression"
+                    )
+                    result_lr_expr["dataset"] = "DREAM5_Ecoli_Expr"
+                    all_expression_results.append(result_lr_expr)
+        except Exception as e:
+            import traceback
+            print(f"DREAM5 E. coli analysis skipped: {e}")
+            traceback.print_exc()
 
     # ============================================================================
     # Generate Final Report

@@ -1063,6 +1063,57 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         return edge_scores
 
+    def cleanup_model(self, target_name: str | None = None) -> None:
+        """Delete the fitted TabPFN model to free GPU memory.
+
+        This method removes the heavy TabPFNRegressor model while preserving
+        the attention weights needed for edge score computation. This is essential
+        when fitting multiple targets to avoid OOM errors.
+
+        Parameters
+        ----------
+        target_name : str, optional
+            Name of the target model to delete. If None, deletes all models.
+            Use this when fitting targets one-by-one to free memory after each fit.
+
+        Examples
+        --------
+        >>> regressor = TabPFNGRNRegressor(tf_names, target_genes)
+        >>> regressor.fit(X, y)
+        >>> # After fit, we only need attention weights for edge scores
+        >>> regressor.cleanup_model()  # Free GPU memory
+        """
+        import gc
+
+        if target_name is None:
+            # Delete all models
+            for model in self.target_models_.values():
+                # Explicitly delete model's internal structures
+                if hasattr(model, 'models_'):
+                    model.models_.clear()
+                if hasattr(model, 'device_'):
+                    delattr(model, 'device_')
+                if hasattr(model, 'devices_'):
+                    delattr(model, 'devices_')
+            self.target_models_.clear()
+        else:
+            # Delete specific target model
+            if target_name in self.target_models_:
+                model = self.target_models_[target_name]
+                # Explicitly delete model's internal structures
+                if hasattr(model, 'models_'):
+                    model.models_.clear()
+                if hasattr(model, 'device_'):
+                    delattr(model, 'device_')
+                if hasattr(model, 'devices_'):
+                    delattr(model, 'devices_')
+                del self.target_models_[target_name]
+
+        # Force garbage collection and CUDA cache clear
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _average_edge_scores(
         self,
         fold_edge_scores: list[dict[tuple[str, str], float]]

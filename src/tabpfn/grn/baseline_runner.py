@@ -352,11 +352,14 @@ class GRNBaselineRunner:
         attention_aggregation: str = "mean",
         edge_score_strategies: list[str] | None = None,
     ) -> dict[str, dict]:
-        """Run TabPFN with multiple edge score strategies, fitting only once.
+        """Run TabPFN with multiple edge score strategies using per-target processing.
 
-        This is more efficient than calling run_method() multiple times,
-        as the model fitting is done once and edge scores are computed
-        for all strategies from the same fitted model.
+        Uses fit_one_target_gene() and get_edge_score_one_target_gene() to handle
+        memory-efficient per-target processing with proper edge score extraction
+        before model cleanup.
+
+        This approach fixes gradient_rollout KeyError errors by extracting edge scores
+        for each target immediately after fitting (before model cleanup).
 
         Parameters
         ----------
@@ -382,7 +385,9 @@ class GRNBaselineRunner:
             Method to aggregate attention
         edge_score_strategies : list[str], optional
             List of edge score strategies to evaluate.
-            If None, uses ['self_attention', 'tf_to_target', 'target_to_tf']
+            If None, uses all 7 strategies: ['self_attention', 'tf_to_target',
+            'target_to_tf', 'combined', 'combined_best', 'sequential_rollout',
+            'gradient_rollout']
 
         Returns
         -------
@@ -390,9 +395,13 @@ class GRNBaselineRunner:
             Dictionary mapping strategy name to result dict with metrics
         """
         import time
+        import gc
 
         if edge_score_strategies is None:
-            edge_score_strategies = ['self_attention', 'tf_to_target', 'target_to_tf']
+            edge_score_strategies = [
+                'self_attention', 'tf_to_target', 'target_to_tf',
+                'combined', 'combined_best', 'sequential_rollout', 'gradient_rollout'
+            ]
 
         # 1. Prepare data using unified pipeline
         prepared = self.pipeline.prepare_data(
@@ -404,41 +413,66 @@ class GRNBaselineRunner:
             max_targets=max_targets,
         )
 
-        # 2. Create TabPFNWrapper and fit ONCE
+        # 2. Create TabPFNWrapper
         from tabpfn.grn.baseline_models import TabPFNWrapper
 
-        # Create wrapper with default strategy (will be overridden)
         wrapper = TabPFNWrapper(
             n_estimators=n_estimators,
             attention_aggregation=attention_aggregation,
             edge_score_strategy=edge_score_strategies[0],  # Default strategy
             device="auto",
             random_state=random_state,
+            keep_model=True,  # Keep model for edge score extraction, cleanup manually
         )
 
-        # Fit ONCE
+        # Initialize edge score dictionaries for each strategy
+        strategy_edge_scores = {strategy: {} for strategy in edge_score_strategies}
+
         start_time = time.time()
-        wrapper.fit(
-            prepared.X,
-            prepared.y,
-            tf_names=prepared.tf_names,
-            target_genes=prepared.target_genes,
-        )
-        training_time = time.time() - start_time
 
-        # 3. Compute edge scores for each strategy (no re-fitting needed)
-        results = {}
-        for strategy in edge_score_strategies:
-            # Get edge scores for this strategy (no re-fit needed)
-            edge_scores = wrapper.get_edge_scores(
-                tf_names=prepared.tf_names,
-                target_genes=prepared.target_genes,
-                edge_score_strategy=strategy,
+        # 3. Outer loop: For each target gene
+        for target_idx, target_name in enumerate(prepared.target_genes):
+            y_target = prepared.y[:, target_idx]
+
+            # Fit this target's model
+            wrapper.fit_one_target_gene(
+                target_idx=target_idx,
+                target_name=target_name,
+                X_for_target=prepared.X,
+                y_target=y_target,
+                tf_names_for_target=prepared.tf_names,
             )
 
-            # Evaluate using unified utility
+            # Inner loop: Extract edge scores for each strategy BEFORE cleanup
+            for strategy in edge_score_strategies:
+                target_edge_scores = wrapper.get_edge_score_one_target_gene(
+                    target_name=target_name,
+                    edge_score_strategy=strategy,
+                )
+                # Add to the strategy's edge score dictionary
+                strategy_edge_scores[strategy].update(target_edge_scores)
+
+            # Manually cleanup after extracting all edge scores for this target
+            wrapper._regressors[target_name].cleanup_model()
+            # CRITICAL: Delete the regressor from _regressors dict to free memory
+            # The regressor contains attention_weights_, X_, y_ and other tensors
+            # that accumulate in GPU memory even after model cleanup
+            del wrapper._regressors[target_name]
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+
+        training_time = time.time() - start_time
+
+        # 4. Evaluate each strategy's edge scores
+        results = {}
+        for strategy in edge_score_strategies:
             result = evaluate_and_format_results(
-                edge_scores=edge_scores,
+                edge_scores=strategy_edge_scores[strategy],
                 gold_standard=prepared.gold_standard,
                 dataset_name=dataset_name,
                 method_name=f"TABPFN ({strategy})",

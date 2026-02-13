@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import torch  # For GPU memory management
 from sklearn.base import BaseEstimator
 
 if TYPE_CHECKING:
@@ -488,6 +489,10 @@ class TabPFNWrapper:
         Device to use for computation
     random_state : int, default=42
         Random state for reproducibility
+    keep_model : bool, default=False
+        If False (default), delete the TabPFN model after fitting to free GPU memory,
+        keeping only attention weights for edge score extraction. If True, keep the
+        model for expression prediction. Set to True only if you need predict().
 
     Examples
     --------
@@ -507,12 +512,14 @@ class TabPFNWrapper:
         edge_score_strategy: str = "self_attention",
         device: str = "auto",
         random_state: int = 42,
+        keep_model: bool = False,
     ):
         self.n_estimators = n_estimators
         self.attention_aggregation = attention_aggregation
         self.edge_score_strategy = edge_score_strategy
         self.device = device
         self.random_state = random_state
+        self.keep_model = keep_model
         # Store individual regressors (one per target gene)
         self._regressors: dict[str, Any] = {}
         # Store fit parameters for prediction
@@ -523,6 +530,140 @@ class TabPFNWrapper:
         # Store prepared features for predict
         self._prepared_features: dict[int, tuple[np.ndarray, list[str]]] = {}
 
+    def fit_one_target_gene(
+        self,
+        target_idx: int,
+        target_name: str,
+        X_for_target: np.ndarray,
+        y_target: np.ndarray,
+        tf_names_for_target: list[str],
+    ) -> "TabPFNWrapper":
+        """Fit a TabPFN model for a single target gene.
+
+        This method creates, fits, and optionally cleans up a model for one target.
+        Use this in a loop for memory-efficient expression prediction.
+
+        Parameters
+        ----------
+        target_idx : int
+            Index of the target gene
+        target_name : str
+            Name of the target gene
+        X_for_target : np.ndarray
+            TF expression matrix for this target (n_samples, n_tfs_for_target)
+        y_target : np.ndarray
+            Target expression values (n_samples,)
+        tf_names_for_target : list[str]
+            TF names for this target (with target excluded if it's a TF)
+
+        Returns
+        -------
+        self
+            Returns self for method chaining
+        """
+        from tabpfn.grn.grn_regressor import TabPFNGRNRegressor
+
+        # Create a separate regressor for this single target
+        single_target_regressor = TabPFNGRNRegressor(
+            tf_names=tf_names_for_target,  # Target excluded from TFs
+            target_genes=[target_name],
+            n_estimators=self.n_estimators,
+            attention_aggregation=self.attention_aggregation,
+            edge_score_strategy=self.edge_score_strategy,
+            device=self.device,
+            random_state=self.random_state,
+        )
+
+        # Fit on the target-specific features
+        single_target_regressor.fit(X_for_target, y_target.reshape(-1, 1))
+
+        # Clean up the heavy TabPFN model to free GPU memory
+        # We only need the attention weights for edge score computation
+        # unless keep_model=True for expression prediction
+        if not self.keep_model:
+            single_target_regressor.cleanup_model()
+
+        # Store the regressor for this target
+        self._regressors[target_name] = single_target_regressor
+
+        return self
+
+    def predict_one_target_gene(
+        self,
+        target_name: str,
+        X: np.ndarray,
+        tf_names_for_target: list[str] | None = None,
+        cleanup_after: bool = False,
+    ) -> np.ndarray:
+        """Predict expression for a single target gene and optionally cleanup.
+
+        This method predicts for one target and optionally deletes the model
+        after prediction to free GPU memory. Use this in a loop for
+        memory-efficient expression prediction.
+
+        Parameters
+        ----------
+        target_name : str
+            Name of the target gene to predict
+        X : np.ndarray
+            Full TF expression matrix (n_samples, n_tfs)
+        tf_names_for_target : list[str], optional
+            TF names that were used for this target during training.
+            If None, uses stored prepared features.
+        cleanup_after : bool, default=False
+            If True, delete the model after prediction to free GPU memory.
+
+        Returns
+        -------
+        predictions : np.ndarray
+            Predicted expression values (n_samples,)
+
+        Raises
+        ------
+        ValueError
+            If target model has been cleaned up and cannot predict
+        """
+        import gc
+
+        if target_name not in self._regressors:
+            raise ValueError(f"No fitted model found for target: {target_name}")
+
+        regressor = self._regressors[target_name]
+
+        # Check if model was cleaned up
+        if not regressor.target_models_:
+            raise ValueError(
+                f"Cannot predict for {target_name}: model was cleaned up. "
+                "Use keep_model=True or fit the target again."
+            )
+
+        # Get the TF indices that were used for this target during training
+        if tf_names_for_target is None:
+            # Use stored prepared features
+            target_idx = self._target_genes.index(target_name)
+            tf_names_for_target = self._prepared_features[target_idx][1]
+
+        # Map TF names back to column indices in X
+        tf_to_idx = {name: i for i, name in enumerate(self._tf_names)}
+        tf_indices = [tf_to_idx[name] for name in tf_names_for_target]
+
+        # Subset X to the features that were used during training
+        X_for_target = X[:, tf_indices]
+        predictions = regressor.predict(X_for_target)
+
+        # Clean up after prediction if requested
+        if cleanup_after:
+            regressor.cleanup_model()
+            # CRITICAL: Delete the regressor from _regressors dict to free memory
+            # The regressor contains attention_weights_, X_, y_ and other tensors
+            # that accumulate in GPU memory even after model cleanup
+            del self._regressors[target_name]
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return predictions
+
     def fit(self, X: np.ndarray, y: np.ndarray, tf_names: list[str] | None = None,
             target_genes: list[str] | None = None) -> "TabPFNWrapper":
         """Train one TabPFN model per target, excluding target from features.
@@ -531,10 +672,7 @@ class TabPFNWrapper:
         gene from its own input features when fitting models, preventing information
         leakage (self-correlation = 1.0).
 
-        Internally creates and fits a TabPFNGRNRegressor which handles:
-        - Model training per target
-        - Attention weight extraction
-        - Edge score computation
+        Internally calls fit_one_target_gene() for each target.
 
         Parameters
         ----------
@@ -551,8 +689,6 @@ class TabPFNWrapper:
         -------
         self
         """
-        from tabpfn.grn.grn_regressor import TabPFNGRNRegressor
-
         # Generate default names if not provided
         if tf_names is None:
             tf_names = [f"TF{i}" for i in range(X.shape[1])]
@@ -577,28 +713,16 @@ class TabPFNWrapper:
         for target_idx, target_name in enumerate(target_genes):
             X_for_target, _ = prepared[target_idx]
             y_target = y[:, target_idx]
-
-            # Get TF names for this target (target excluded if it's a TF)
             tf_names_for_target = prepared[target_idx][1]
 
-            # Create a separate regressor for this single target
-            # This uses the full TabPFNGRNRegressor infrastructure for edge score computation
-            single_target_regressor = TabPFNGRNRegressor(
-                tf_names=tf_names_for_target,  # Target excluded from TFs
-                target_genes=[target_name],
-                n_estimators=self.n_estimators,
-                attention_aggregation=self.attention_aggregation,
-                edge_score_strategy=self.edge_score_strategy,
-                device=self.device,
-                random_state=self.random_state,
+            # Call fit_one_target_gene for each target
+            self.fit_one_target_gene(
+                target_idx=target_idx,
+                target_name=target_name,
+                X_for_target=X_for_target,
+                y_target=y_target,
+                tf_names_for_target=tf_names_for_target,
             )
-
-            # Fit on the target-specific features
-            single_target_regressor.fit(X_for_target, y_target.reshape(-1, 1))
-
-            # Store the entire regressor for this target
-            # It already has the fitted model and attention weights internally
-            self._regressors[target_name] = single_target_regressor
 
         return self
 
@@ -606,6 +730,7 @@ class TabPFNWrapper:
         """Predict expression for all targets using fitted TabPFN models.
 
         Each target's model makes predictions using the features it was trained on.
+        Internally calls predict_one_target_gene() for each target.
 
         Parameters
         ----------
@@ -625,23 +750,95 @@ class TabPFNWrapper:
         if not self._regressors:
             raise ValueError("Models must be fitted before prediction")
 
+        # Check if models were cleaned up (keep_model=False)
+        if not self.keep_model:
+            # Check if any regressor has an empty target_models_
+            first_regressor = next(iter(self._regressors.values()))
+            if not first_regressor.target_models_:
+                raise ValueError(
+                    "Cannot predict: models were cleaned up to save GPU memory. "
+                    "Initialize TabPFNWrapper with keep_model=True if you need predict()."
+                )
+
         n_samples = X.shape[0]
         n_targets = len(self._regressors)
         predictions = np.zeros((n_samples, n_targets))
 
         # Predict using each fitted regressor
-        for target_idx, (target_name, regressor) in enumerate(self._regressors.items()):
-            # Get the TF indices that were used for this target during training
+        # Uses predict_one_target_gene() for each target
+        for target_idx, (target_name, _) in enumerate(self._regressors.items()):
+            # Get TF names that were used for this target during training
             tf_names_for_target = self._prepared_features[target_idx][1]
-            # Map TF names back to column indices in X
-            tf_to_idx = {name: i for i, name in enumerate(self._tf_names)}
-            tf_indices = [tf_to_idx[name] for name in tf_names_for_target]
-
-            # Subset X to the features that were used during training
-            X_for_target = X[:, tf_indices]
-            predictions[:, target_idx] = regressor.predict(X_for_target)
+            # Call predict_one_target_gene for this target
+            predictions[:, target_idx] = self.predict_one_target_gene(
+                target_name=target_name,
+                X=X,
+                tf_names_for_target=tf_names_for_target,
+                cleanup_after=False,  # Don't cleanup here, models already kept
+            )
 
         return predictions
+
+    def get_edge_score_one_target_gene(
+        self,
+        target_name: str,
+        edge_score_strategy: str | None = None,
+    ) -> dict[tuple[str, str], float]:
+        """Get edge scores for a single target gene before cleanup.
+
+        This method extracts edge scores for a single target gene,
+        which can be called before cleanup_model() to avoid OOM errors.
+        It uses the regressor's existing get_edge_scores() method
+        which handles all edge score strategies properly.
+
+        Parameters
+        ----------
+        target_name : str
+            Name of the target gene to get edge scores for
+        edge_score_strategy : str, optional
+            Edge score strategy to use. If None, uses the strategy from __init__.
+            Options: 'self_attention', 'tf_to_target', 'target_to_tf', 'sequential_rollout'
+
+        Returns
+        -------
+        edge_scores : dict
+            Dictionary mapping (tf, target_name) -> importance score for this target only
+
+        Raises
+        ------
+        ValueError
+            If model for target_name hasn't been fitted yet
+
+        Examples
+        --------
+        >>> from tabpfn.grn.baseline_models import TabPFNWrapper
+        >>> wrapper = TabPFNWrapper(n_estimators=1)
+        >>> wrapper.fit_one_target_gene(0, "G1", X_train, y_train[:, 0], tf_names)
+        >>> # Get edge scores before cleanup
+        >>> edge_scores_g1 = wrapper.get_edge_score_one_target_gene("G1")
+        >>> # Now safe to cleanup
+        >>> wrapper._regressors["G1"].cleanup_model()
+        """
+        if target_name not in self._regressors:
+            raise ValueError(f"Model for {target_name} hasn't been fitted yet")
+
+        # Get the regressor for this target
+        regressor = self._regressors[target_name]
+
+        # Use provided strategy or fall back to the default from __init__
+        strategy = edge_score_strategy if edge_score_strategy is not None else self.edge_score_strategy
+
+        # Filter edge scores for this target only from the regressor's scores
+        all_edge_scores = regressor.get_edge_scores(edge_score_strategy=strategy)
+
+        # Filter to only include edges for this target
+        target_edge_scores = {
+            (tf, tgt): score
+            for (tf, tgt), score in all_edge_scores.items()
+            if tgt == target_name
+        }
+
+        return target_edge_scores
 
     def get_edge_scores(
         self,
