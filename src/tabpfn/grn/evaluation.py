@@ -26,6 +26,23 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
+def _extract_true_edges(
+    gold_standard: "pd.DataFrame | set[tuple[str, str]]",
+) -> set[tuple[str, str]]:
+    """Extract the set of true positive edges from a gold standard.
+
+    Handles both DataFrame (filters by weight==1 if column exists)
+    and set formats.
+    """
+    if isinstance(gold_standard, set):
+        return gold_standard
+    # pd.DataFrame
+    if "weight" in gold_standard.columns:
+        pos = gold_standard[gold_standard["weight"] == 1]
+        return set(zip(pos["tf"], pos["target"]))
+    return set(zip(gold_standard["tf"], gold_standard["target"]))
+
+
 def compute_auroc(
     inferred_edges: dict[tuple[str, str], float] | "nx.DiGraph",
     gold_standard: "pd.DataFrame" | set[tuple[str, str]],
@@ -72,11 +89,8 @@ def compute_auroc(
     if not edge_list:
         return 0.0
 
-    # Create set of true edges
-    if isinstance(gold_standard, set):
-        true_edges = gold_standard
-    else:  # pd.DataFrame
-        true_edges = set(zip(gold_standard["tf"], gold_standard["target"]))
+    # Create set of true edges (only positive edges with weight=1)
+    true_edges = _extract_true_edges(gold_standard)
 
     # Get all possible TF-target pairs
     all_pairs = [(tf, tgt) for tf, tgt, _ in edge_list]
@@ -158,11 +172,8 @@ def compute_aupr(
     if not edge_list:
         return 0.0
 
-    # Create set of true edges
-    if isinstance(gold_standard, set):
-        true_edges = gold_standard
-    else:  # pd.DataFrame
-        true_edges = set(zip(gold_standard["tf"], gold_standard["target"]))
+    # Create set of true edges (only positive edges with weight=1)
+    true_edges = _extract_true_edges(gold_standard)
 
     # Get all possible TF-target pairs
     all_pairs = [(tf, tgt) for tf, tgt, _ in edge_list]
@@ -248,11 +259,8 @@ def compute_precision_at_k(
     if not edge_list:
         return 0.0
 
-    # Create set of true edges
-    if isinstance(gold_standard, set):
-        true_edges = gold_standard
-    else:  # pd.DataFrame
-        true_edges = set(zip(gold_standard["tf"], gold_standard["target"]))
+    # Create set of true edges (only positive edges with weight=1)
+    true_edges = _extract_true_edges(gold_standard)
 
     # Sort edges by score (descending) and take top k
     edge_list.sort(key=lambda x: x[2], reverse=True)
@@ -314,11 +322,8 @@ def compute_recall_at_k(
     if not edge_list:
         return 0.0
 
-    # Create set of true edges
-    if isinstance(gold_standard, set):
-        true_edges = gold_standard
-    else:  # pd.DataFrame
-        true_edges = set(zip(gold_standard["tf"], gold_standard["target"]))
+    # Create set of true edges (only positive edges with weight=1)
+    true_edges = _extract_true_edges(gold_standard)
 
     if not true_edges:
         return 0.0

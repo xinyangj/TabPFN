@@ -678,8 +678,8 @@ def load_dataset(
     args: argparse.Namespace,
     dream4_path: Path,
     dream5_path: Path,
-) -> dict[str, Any]:
-    """Load and preprocess a DREAM dataset, returning a standardized data dict.
+) -> list[dict[str, Any]]:
+    """Load and preprocess a DREAM dataset, returning standardized data dicts.
 
     Parameters
     ----------
@@ -694,9 +694,10 @@ def load_dataset(
 
     Returns
     -------
-    data : dict
-        Standardized dict with keys: expression, gene_names, tf_names,
-        gold_standard, dataset_name, X, y, target_genes, expr_label
+    datasets : list of dict
+        List of standardized dicts, one per network. Each dict has keys:
+        expression, gene_names, tf_names, gold_standard, dataset_name,
+        X, y, target_genes, expr_label
     """
     if dataset_key == "dream4-10":
         dream4_loader = DREAMChallengeLoader(data_path=str(dream4_path))
@@ -707,49 +708,62 @@ def load_dataset(
         elif args.max_networks:
             network_ids_to_run = range(1, min(args.max_networks + 1, 6))
         else:
-            network_ids_to_run = range(1, 3)  # Default: 2 networks for speed
+            network_ids_to_run = range(1, 6)  # Default: all 5 networks
 
+        datasets = []
         for network_id in network_ids_to_run:
             expression, gene_names, tf_names, gold_standard = dream4_loader.load_dream4(
                 network_size=10, network_id=network_id
             )
 
-        preprocessor = GRNPreprocessor(normalization="zscore")
-        X, y, tf_indices, target_indices = preprocessor.fit_transform(
-            expression, gene_names, tf_names
-        )
-        target_genes = preprocessor.get_target_names()
-        dataset_name = f"DREAM4_10_{network_id}"
+            preprocessor = GRNPreprocessor(normalization="zscore")
+            X, y, tf_indices, target_indices = preprocessor.fit_transform(
+                expression, gene_names, tf_names
+            )
+            target_genes = preprocessor.get_target_names()
 
-        return {
-            "expression": expression, "gene_names": gene_names,
-            "tf_names": tf_names, "gold_standard": gold_standard,
-            "dataset_name": dataset_name, "X": X, "y": y,
-            "target_genes": target_genes,
-            "expr_label": f"DREAM4_10_{network_id}_Expr",
-            "target_genes_for_runner": None,
-        }
+            datasets.append({
+                "expression": expression, "gene_names": gene_names,
+                "tf_names": tf_names, "gold_standard": gold_standard,
+                "dataset_name": f"DREAM4_10_{network_id}", "X": X, "y": y,
+                "target_genes": target_genes,
+                "expr_label": f"DREAM4_10_{network_id}_Expr",
+                "target_genes_for_runner": None,
+            })
+        return datasets
 
     elif dataset_key == "dream4-100":
         dream4_loader = DREAMChallengeLoader(data_path=str(dream4_path))
-        expression, gene_names, tf_names, gold_standard = dream4_loader.load_dream4(
-            network_size=100, network_id=1
-        )
 
-        preprocessor = GRNPreprocessor(normalization="zscore")
-        X, y, tf_indices, target_indices = preprocessor.fit_transform(
-            expression, gene_names, tf_names
-        )
-        target_genes = preprocessor.get_target_names()
+        # Determine network IDs to run
+        if args.network_ids:
+            network_ids_to_run = args.network_ids
+        elif args.max_networks:
+            network_ids_to_run = range(1, min(args.max_networks + 1, 6))
+        else:
+            network_ids_to_run = [1]  # Default: network 1 (100-gene is expensive)
 
-        return {
-            "expression": expression, "gene_names": gene_names,
-            "tf_names": tf_names, "gold_standard": gold_standard,
-            "dataset_name": "DREAM4_100_1", "X": X, "y": y,
-            "target_genes": target_genes,
-            "expr_label": "DREAM4_100_Expr",
-            "target_genes_for_runner": None,
-        }
+        datasets = []
+        for network_id in network_ids_to_run:
+            expression, gene_names, tf_names, gold_standard = dream4_loader.load_dream4(
+                network_size=100, network_id=network_id
+            )
+
+            preprocessor = GRNPreprocessor(normalization="zscore")
+            X, y, tf_indices, target_indices = preprocessor.fit_transform(
+                expression, gene_names, tf_names
+            )
+            target_genes = preprocessor.get_target_names()
+
+            datasets.append({
+                "expression": expression, "gene_names": gene_names,
+                "tf_names": tf_names, "gold_standard": gold_standard,
+                "dataset_name": f"DREAM4_100_{network_id}", "X": X, "y": y,
+                "target_genes": target_genes,
+                "expr_label": f"DREAM4_100_{network_id}_Expr",
+                "target_genes_for_runner": None,
+            })
+        return datasets
 
     elif dataset_key == "dream5":
         import pandas as pd
@@ -761,8 +775,12 @@ def load_dataset(
         dream5_loader = DREAMChallengeLoader(data_path=str(dream5_path))
         expression, gene_names, tf_names, gold_standard = dream5_loader.load_dream5_ecoli()
 
-        # Convert gold_standard DataFrame to set if needed
+        # Convert gold_standard DataFrame to set of positive edges only
         if isinstance(gold_standard, pd.DataFrame):
+            # Filter to only positive edges (weight=1) if weight column exists
+            if "weight" in gold_standard.columns:
+                gold_standard = gold_standard[gold_standard["weight"] == 1]
+
             gs_set = set()
             for _, row in gold_standard.iterrows():
                 if "tf" in row and "target" in row:
@@ -812,7 +830,7 @@ def load_dataset(
         expression_for_baseline = expression_filtered[:, tf_indices_filtered + target_indices_filtered]
         gene_names_for_baseline = tf_names_filtered + target_genes
 
-        return {
+        return [{
             "expression": expression_for_baseline,
             "gene_names": gene_names_for_baseline,
             "tf_names": tf_names_filtered,
@@ -822,7 +840,7 @@ def load_dataset(
             "target_genes": target_genes,
             "expr_label": "DREAM5_Ecoli_Expr",
             "target_genes_for_runner": target_genes,
-        }
+        }]
     else:
         raise ValueError(f"Unknown dataset: {dataset_key}")
 
@@ -1026,10 +1044,12 @@ def main() -> None:
         print("="*80)
 
         try:
-            data = load_dataset(dataset_key, args, dream4_path, dream5_path)
-            run_dataset_analysis(
-                data, args, tabpfn_strategies, all_results, all_expression_results
-            )
+            datasets = load_dataset(dataset_key, args, dream4_path, dream5_path)
+            for data in datasets:
+                print(f"\n  >> Running: {data['dataset_name']}")
+                run_dataset_analysis(
+                    data, args, tabpfn_strategies, all_results, all_expression_results
+                )
         except Exception as e:
             import traceback
             print(f"{dataset_key} analysis skipped: {e}")

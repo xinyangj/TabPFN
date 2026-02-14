@@ -266,7 +266,10 @@ def evaluate_and_format_results(
     if isinstance(gold_standard, set):
         num_edges = len(gold_standard)
     else:  # DataFrame
-        num_edges = len(gold_standard)
+        if "weight" in gold_standard.columns:
+            num_edges = int((gold_standard["weight"] == 1).sum())
+        else:
+            num_edges = len(gold_standard)
     k_values = [10, 50, 100] if num_edges > 50 else [5, 10, 20]
 
     # Evaluate GRN predictions

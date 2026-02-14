@@ -150,7 +150,9 @@ class DREAMChallengeLoader:
         # Load gold standard network
         gold_path = self.data_path / "ecoli_gold_standard.csv"
         if gold_path.exists():
-            gold_standard = pd.read_csv(gold_path)
+            gold_standard = pd.read_csv(
+                gold_path, header=None, names=["tf", "target", "weight"]
+            )
         else:
             # Create synthetic gold standard
             warnings.warn(
