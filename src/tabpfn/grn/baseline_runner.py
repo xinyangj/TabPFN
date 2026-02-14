@@ -250,13 +250,22 @@ class GRNBaselineRunner:
 
         edge_scores = {}
         for j, tgt in enumerate(prepared.target_genes):
+            # Exclude target gene from input features to prevent leakage
+            tf_indices_to_use = []
+            tf_names_to_use = []
+            for tf_idx, tf_name in enumerate(prepared.tf_names):
+                if tf_name != tgt:
+                    tf_indices_to_use.append(tf_idx)
+                    tf_names_to_use.append(tf_name)
+
+            X_for_target = prepared.X[:, tf_indices_to_use] if tf_indices_to_use else prepared.X
             mi_scores = mutual_info_regression(
-                prepared.X,
+                X_for_target,
                 prepared.y[:, j],
                 random_state=42,
             )
-            for i, tf in enumerate(prepared.tf_names):
-                edge_scores[(tf, tgt)] = mi_scores[i]
+            for i, tf_name in enumerate(tf_names_to_use if tf_indices_to_use else prepared.tf_names):
+                edge_scores[(tf_name, tgt)] = mi_scores[i]
 
         # Normalize to [0, 1]
         max_score = max(edge_scores.values()) if edge_scores else 1.0
@@ -430,17 +439,31 @@ class GRNBaselineRunner:
 
         start_time = time.time()
 
+        # Precompute per-target features with target exclusion
+        from tabpfn.grn.utils import compute_target_feature_indices
+        per_target_features = {}
+        for target_idx, target_name in enumerate(prepared.target_genes):
+            tf_indices, tf_names_for_target, _ = compute_target_feature_indices(
+                tf_names=prepared.tf_names,
+                target_name=target_name,
+            )
+            per_target_features[target_idx] = (
+                prepared.X[:, tf_indices],
+                tf_names_for_target,
+            )
+
         # 3. Outer loop: For each target gene
         for target_idx, target_name in enumerate(prepared.target_genes):
             y_target = prepared.y[:, target_idx]
+            X_for_target, tf_names_for_target = per_target_features[target_idx]
 
             # Fit this target's model
             wrapper.fit_one_target_gene(
                 target_idx=target_idx,
                 target_name=target_name,
-                X_for_target=prepared.X,
+                X_for_target=X_for_target,
                 y_target=y_target,
-                tf_names_for_target=prepared.tf_names,
+                tf_names_for_target=tf_names_for_target,
             )
 
             # Inner loop: Extract edge scores for each strategy BEFORE cleanup

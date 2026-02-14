@@ -342,6 +342,10 @@ class TabPFNGRNRegressor(BaseEstimator):
         target_idx = num_feature_blocks - 1
         head_combination = "weighted" if head_weights else "mean"
 
+        # Build feature-to-block mapping
+        from tabpfn.grn.utils import compute_feature_to_block_mapping
+        f2b, _ = compute_feature_to_block_mapping(len(self.tf_names), num_feature_blocks + 1)
+
         if self.use_kronecker:
             scores = compute_kronecker_rollout_scores(
                 attention,
@@ -353,10 +357,9 @@ class TabPFNGRNRegressor(BaseEstimator):
 
             edge_scores: dict[tuple[str, str], float] = {}
             for tf_idx, tf_name in enumerate(self.tf_names):
-                if tf_idx < target_idx:
-                    edge_scores[(tf_name, target_name)] = scores[tf_idx].item()
-                else:
-                    edge_scores[(tf_name, target_name)] = 0.0
+                blocks = f2b[tf_idx]
+                score = sum(scores[b].item() for b in blocks) / len(blocks)
+                edge_scores[(tf_name, target_name)] = score
         else:
             aggregation = "gradient_weighted" if head_weights else "sequential_rollout"
             computer = EdgeScoreComputer(aggregation_method=aggregation)
@@ -375,21 +378,23 @@ class TabPFNGRNRegressor(BaseEstimator):
             else:
                 raise ValueError("Cannot determine num_items from attention weights")
 
-            valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
+            # Collect all unique block indices we need scores for
+            all_block_indices = sorted({b for blocks in f2b.values() for b in blocks})
             edge_scores = {}
 
-            if valid_tf_indices:
+            if all_block_indices:
                 tf_tensor = torch.tensor(
-                    valid_tf_indices, device=rollout_matrix.device, dtype=torch.long
+                    all_block_indices, device=rollout_matrix.device, dtype=torch.long
                 )
                 mean_scores = _extract_rollout_scores_vectorized(
                     rollout_matrix, tf_tensor, target_idx, num_items, num_feature_blocks
                 )
-                for idx, tf_idx in enumerate(valid_tf_indices):
-                    edge_scores[(self.tf_names[tf_idx], target_name)] = mean_scores[idx].item()
+                block_score_map = {b: mean_scores[i].item() for i, b in enumerate(all_block_indices)}
 
-            for tf_idx in range(target_idx, len(self.tf_names)):
-                edge_scores[(self.tf_names[tf_idx], target_name)] = 0.0
+                for tf_idx, tf_name in enumerate(self.tf_names):
+                    blocks = f2b[tf_idx]
+                    score = sum(block_score_map[b] for b in blocks) / len(blocks)
+                    edge_scores[(tf_name, target_name)] = score
 
         return edge_scores
 
@@ -517,40 +522,32 @@ class TabPFNGRNRegressor(BaseEstimator):
 
                 # feat_attn is now [n_feat_pos, n_feat_pos]
                 # KEY: The last position (-1) is the TARGET gene (concatenated during preprocessing)
-                # Positions 0 to (n_feat_pos-2) are the TF features
+                # Positions 0 to (n_feat_pos-2) are TF feature blocks
                 n_feat_pos = feat_attn.shape[0]
                 target_pos = n_feat_pos - 1  # Last position is the target
 
+                # Build feature-to-block mapping (TFs may share blocks)
+                from tabpfn.grn.utils import compute_feature_to_block_mapping
+                f2b, _ = compute_feature_to_block_mapping(len(self.tf_names), n_feat_pos)
+
                 # Extract scores for each TF using the specified strategy
                 for tf_idx, tf_name in enumerate(self.tf_names):
-                    if tf_idx >= n_feat_pos - 1:  # -1 because last position is target
-                        # If we have more TFs than feature positions (excluding target), use 0
-                        score = 0.0
-                    elif self.edge_score_strategy == "self_attention":
-                        # Strategy 1: TF self-attention (diagonal)
-                        # Measures how much the TF position attends to itself
-                        score = feat_attn[tf_idx, tf_idx].item()
+                    blocks = f2b[tf_idx]
+
+                    if self.edge_score_strategy == "self_attention":
+                        score = sum(feat_attn[b, b].item() for b in blocks) / len(blocks)
                     elif self.edge_score_strategy == "tf_to_target":
-                        # Strategy 2: TF -> Target attention
-                        # Measures how much TF attends to the target
-                        score = feat_attn[tf_idx, target_pos].item()
+                        score = sum(feat_attn[b, target_pos].item() for b in blocks) / len(blocks)
                     elif self.edge_score_strategy == "target_to_tf":
-                        # Strategy 3: Target -> TF attention
-                        # Measures how much target attends to the TF
-                        score = feat_attn[target_pos, tf_idx].item()
+                        score = sum(feat_attn[target_pos, b].item() for b in blocks) / len(blocks)
                     elif self.edge_score_strategy == "combined":
-                        # Strategy 4: Combined (weighted average of all three)
-                        s_self = feat_attn[tf_idx, tf_idx].item()
-                        s_tf_targ = feat_attn[tf_idx, target_pos].item()
-                        s_targ_tf = feat_attn[target_pos, tf_idx].item()
-                        # Equal weights for now (could be optimized)
+                        s_self = sum(feat_attn[b, b].item() for b in blocks) / len(blocks)
+                        s_tf_targ = sum(feat_attn[b, target_pos].item() for b in blocks) / len(blocks)
+                        s_targ_tf = sum(feat_attn[target_pos, b].item() for b in blocks) / len(blocks)
                         score = (s_self + s_tf_targ + s_targ_tf) / 3
                     elif self.edge_score_strategy == "combined_best":
-                        # Strategy 5: Combined BEST (only self_attention and tf_to_target)
-                        # Excludes target_to_tf which performed poorly
-                        s_self = feat_attn[tf_idx, tf_idx].item()
-                        s_tf_targ = feat_attn[tf_idx, target_pos].item()
-                        # Equal weights (could be optimized based on dataset size)
+                        s_self = sum(feat_attn[b, b].item() for b in blocks) / len(blocks)
+                        s_tf_targ = sum(feat_attn[b, target_pos].item() for b in blocks) / len(blocks)
                         score = (s_self + s_tf_targ) / 2
                     else:
                         raise ValueError(f"Unknown edge_score_strategy: {self.edge_score_strategy}")

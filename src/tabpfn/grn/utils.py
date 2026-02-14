@@ -126,6 +126,47 @@ def compute_target_feature_indices(
     return tf_indices_excluding_target, tf_names_excluding_target, modified_to_original_idx_map
 
 
+def compute_feature_to_block_mapping(
+    n_features: int,
+    n_feat_pos: int,
+) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """Map raw feature indices to attention block indices.
+
+    TabPFN encodes each raw feature as 2 values (value + nan_indicator),
+    then groups every ``features_per_group=3`` encoded values into one
+    attention block.  The target is appended as the last block.
+
+    Parameters
+    ----------
+    n_features : int
+        Number of raw input features (TFs).
+    n_feat_pos : int
+        Number of attention positions (from actual attention tensor shape).
+        The last position is the target block.
+
+    Returns
+    -------
+    feature_to_blocks : dict[int, list[int]]
+        Maps each raw feature index to its attention block index(es).
+    block_to_features : dict[int, list[int]]
+        Maps each attention block index to its raw feature index(es).
+    """
+    n_blocks = n_feat_pos - 1  # exclude target position
+    feature_to_blocks: dict[int, list[int]] = {}
+    block_to_features: dict[int, list[int]] = {b: [] for b in range(n_blocks)}
+
+    for i in range(n_features):
+        b0 = (2 * i) // 3
+        b1 = (2 * i + 1) // 3
+        blocks = sorted({min(b0, n_blocks - 1), min(b1, n_blocks - 1)})
+        feature_to_blocks[i] = blocks
+        for b in blocks:
+            if i not in block_to_features[b]:
+                block_to_features[b].append(i)
+
+    return feature_to_blocks, block_to_features
+
+
 def create_edge_score_dict(
     tf_names: list[str],
     target_genes: list[str],
