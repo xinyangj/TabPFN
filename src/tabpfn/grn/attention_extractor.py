@@ -17,7 +17,6 @@ according to their importance for predicting specific target genes.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
@@ -238,6 +237,11 @@ class AttentionExtractor:
             # Get attention weights from module
             weights = module.get_attention_weights()
             if weights is not None:
+                # Skip attention tensors that contain NaN (can occur in
+                # later layers for some targets) to prevent NaN propagation
+                # through rollout computations.
+                if torch.isnan(weights).any():
+                    continue
                 attention_weights[layer_key][attn_type] = weights
 
         return attention_weights
@@ -458,6 +462,123 @@ def build_items_attention_matrix(
     # Reversed Kronecker product: J ⊗ item_attn
     # This broadcasts each item_attn[fi,fj] across all item pairs
     return torch.kron(J, item_attn)
+
+
+def compute_kronecker_rollout_scores(
+    attention_weights: dict[str, dict[str, torch.Tensor]],
+    target_idx: int,
+    *,
+    head_combination: str = "mean",
+    head_weights: dict[str, dict[str, torch.Tensor]] | None = None,
+    add_residual: bool = True,
+) -> torch.Tensor:
+    """Compute rollout edge scores without forming the N×N rollout matrix.
+
+    Exploits the Kronecker structure of the per-layer attention matrices:
+
+    - ``A_feat = normalize(feat_attn ⊗ J_F + I)``
+    - ``A_items = normalize(J_M ⊗ item_attn + I)``
+
+    Instead of materialising the full ``(M*F, M*F)`` rollout matrix, this
+    function tracks only the *target columns* as an ``(M, F, M)`` tensor,
+    reducing memory from ``O(M²F²)`` to ``O(M²F)``.  The result is
+    **mathematically identical** to the full-matrix rollout.
+
+    Parameters
+    ----------
+    attention_weights : dict
+        Nested dict from :class:`AttentionExtractor`.
+    target_idx : int
+        Index of target gene within the feature blocks.
+    head_combination : str, default='mean'
+        How to combine attention heads (``'mean'``, ``'max'``, or
+        ``'weighted'`` when *head_weights* is provided).
+    head_weights : dict, optional
+        Gradient-computed per-head weights from
+        :class:`GradientAttentionExtractor`.  Required when
+        *head_combination* is ``'weighted'``.
+    add_residual : bool, default=True
+        Whether to add residual (identity) connections.
+
+    Returns
+    -------
+    scores : torch.Tensor
+        ``(num_feature_blocks,)`` edge scores.  ``scores[f]`` is the
+        rollout-based importance of feature block *f* for *target_idx*.
+    """
+    R: torch.Tensor | None = None
+    M: int | None = None
+    F: int | None = None
+
+    for layer_key in sorted(
+        attention_weights.keys(), key=lambda x: int(x.split("_")[1])
+    ):
+        layer_data = attention_weights[layer_key]
+        if "between_features" not in layer_data or "between_items" not in layer_data:
+            continue
+
+        feat_raw = layer_data["between_features"]  # (batch, M, M, nheads)
+        item_raw = layer_data["between_items"]      # (batch, F, F, nheads)
+
+        # Average over batch first
+        feat_raw = feat_raw.mean(dim=0)  # (M, M, nheads)
+        item_raw = item_raw.mean(dim=0)  # (F, F, nheads)
+
+        # Apply head weights if available, then combine heads
+        lw = head_weights.get(layer_key, {}) if head_weights else {}
+
+        if head_combination == "weighted" and "between_features" in lw:
+            feat_raw = feat_raw * lw["between_features"].view(1, 1, -1)
+        if head_combination == "weighted" and "between_items" in lw:
+            item_raw = item_raw * lw["between_items"].view(1, 1, -1)
+
+        if head_combination in ("mean", "weighted"):
+            feat_attn = feat_raw.mean(dim=-1)  # (M, M)
+            item_attn = item_raw.mean(dim=-1)  # (F, F)
+        elif head_combination == "max":
+            feat_attn = feat_raw.max(dim=-1)[0]
+            item_attn = item_raw.max(dim=-1)[0]
+        else:
+            raise ValueError(f"Unknown head_combination: {head_combination}")
+
+        cur_M = feat_attn.size(0)
+        cur_F = item_attn.size(0)
+
+        # Initialise R on first layer
+        if R is None:
+            M, F = cur_M, cur_F
+            R = torch.zeros(M, F, M, device=feat_attn.device, dtype=feat_attn.dtype)
+            for i in range(M):
+                R[i, target_idx, i] = 1.0
+
+        # Row-normalisation constants (separable thanks to Kronecker structure)
+        if add_residual:
+            norm_feat = cur_F * feat_attn.sum(dim=1) + 1  # (M,)
+            norm_items = cur_M * item_attn.sum(dim=1) + 1  # (F,)
+        else:
+            norm_feat = cur_F * feat_attn.sum(dim=1).clamp(min=1e-8)
+            norm_items = cur_M * item_attn.sum(dim=1).clamp(min=1e-8)
+
+        # --- Step 1: A_feat @ R ---
+        R_sum_f = R.sum(dim=1)                        # (M, M)
+        kron_feat = feat_attn @ R_sum_f                # (M, M)
+        R = kron_feat[:, None, :].expand_as(R) + (R if add_residual else 0)
+        R = R / norm_feat[:, None, None]
+
+        # --- Step 2: A_items @ R ---
+        R_sum_i = R.sum(dim=0)                         # (F, M)
+        kron_items = item_attn @ R_sum_i               # (F, M)
+        R = kron_items[None, :, :].expand_as(R) + (R if add_residual else 0)
+        R = R / norm_items[None, :, None]
+
+    if R is None or M is None:
+        raise ValueError("No valid attention layers found for rollout")
+
+    # Extract scores: average the diagonal blocks over items
+    # scores[f] = (1/M) * Σ_i R[i, f, i]
+    diag_indices = torch.arange(M, device=R.device)
+    scores = R[diag_indices, :, diag_indices].mean(dim=0)  # (F,)
+    return scores
 
 
 def compute_sequential_attention_rollout(
@@ -980,11 +1101,12 @@ class GradientAttentionExtractor(AttentionExtractor):
         y_target: torch.Tensor,
         encoder: Any,
     ) -> dict[str, torch.Tensor]:
-        """Compute gradients of prediction w.r.t. attention outputs.
+        """Compute gradients of prediction w.r.t. attention weight tensors.
 
-        Uses TabPFN's internal forward pass to compute gradients of the specific
-        target prediction with respect to attention weights. This enables
-        gradient-based head importance weighting for attention rollout.
+        Uses ``retain_grad()`` on per-head attention weight tensors cached by
+        :class:`~tabpfn.architectures.base.attention.full_attention.MultiHeadAttention`
+        so that ``loss.backward()`` populates ``.grad`` with the correct shape
+        ``(batch, seq_q, seq_k, nheads)``.
 
         Parameters
         ----------
@@ -1000,274 +1122,106 @@ class GradientAttentionExtractor(AttentionExtractor):
         Returns
         -------
         gradients : dict
-            Dictionary mapping layer_attn_type to gradient tensors
-
-        Notes
-        -----
-        The key insight is that TabPFN uses in-context learning where:
-        1. X and y_target are concatenated as feature tokens
-        2. The model predicts the target gene from TF context
-        3. We compute gradients of this prediction w.r.t. attention weights
-        4. Gradient magnitude indicates head importance for target prediction
+            Dictionary mapping ``layer_{idx}_{attn_type}`` to gradient tensors
+            of shape ``(batch, seq_q, seq_k, nheads)``.
         """
         gradients: dict[str, torch.Tensor] = {}
-        hooks: list[Any] = []
 
-        # Ensure model is in eval mode but gradients are enabled
-        model.eval()
-        torch.set_grad_enabled(True)
-
-        def make_gradient_hook(layer_key: str, attn_type: str) -> Callable:
-            """Create a hook to capture gradients from attention outputs."""
-            def hook(module: Any, grad_input: tuple, grad_output: tuple) -> None:
-                # Capture gradients from attention output during backward pass
-                if grad_output and len(grad_output) > 0 and grad_output[0] is not None:
-                    key = f"layer_{layer_key}_{attn_type}"
-                    # Store gradient preserving per-head information
-                    # Shape typically: (batch, seq_len, seq_len, nheads)
-                    gradients[key] = grad_output[0].detach().clone()
-            return hook
-
-        # Register gradient hooks on all attention modules
-        for layer_idx, layer in enumerate(encoder.layers):
-            layer_key = str(layer_idx)
-
-            # Register hooks for between_features attention
-            if hasattr(layer, "self_attn_between_features") and layer.self_attn_between_features is not None:
-                hook = layer.self_attn_between_features.register_full_backward_hook(
-                    make_gradient_hook(layer_key, "between_features")
-                )
-                hooks.append(hook)
-
-            # Register hooks for between_items attention
-            if hasattr(layer, "self_attn_between_items") and layer.self_attn_between_items is not None:
-                hook = layer.self_attn_between_items.register_full_backward_hook(
-                    make_gradient_hook(layer_key, "between_items")
-                )
-                hooks.append(hook)
-
-        try:
-            # Use TabPFN's internal forward mechanism for gradient computation
-            # TabPFNRegressor wraps PerFeatureTransformer which needs proper context
-            print(f"    [GRADIENT] Starting gradient computation for target prediction...")
-            print(f"    [GRADIENT] X shape: {X.shape}, y_target shape: {y_target.shape}")
-            print(f"    [GRADIENT] Model type: {type(model).__name__}")
-
-            # Check if this is a TabPFN PerFeatureTransformer
-            is_tabpfn_model = (
-                hasattr(model, "forward") and
-                hasattr(model, "transformer_encoder") and
-                hasattr(model, "encoder")
-            )
-
-            print(f"    [GRADIENT] Is TabPFN PerFeatureTransformer: {is_tabpfn_model}")
-
-            if is_tabpfn_model:
-                print(f"    [GRADIENT] Using TabPFN PerFeatureTransformer for gradient computation...")
-
-                # Key insight: TabPFN uses single_eval_pos to determine where predictions start
-                # single_eval_pos = y["main"].shape[0] (predictions from this position onwards)
-                # To get predictions, we must split data into:
-                # 1. Training context (first n_train samples with y provided)
-                # 2. Test samples (remaining samples with y withheld)
-
-                seq_len, n_features = X.shape
-
-                # Use 80% for training context, 20% for prediction
-                n_train = max(1, int(seq_len * 0.8))
-                n_test = seq_len - n_train
-
-                print(f"    [GRADIENT] Total samples: {seq_len}")
-                print(f"    [GRADIENT] Training context: {n_train} samples")
-                print(f"    [GRADIENT] Test samples: {n_test} samples")
-
-                # Prepare X (all samples)
-                batch_size = 1
-                X_reshaped = X.unsqueeze(1)  # (seq_len, 1, n_features)
-
-                # Prepare y - only provide for training context!
-                # This is the KEY: y is only provided for first n_train samples
-                # The model will predict the remaining n_test samples
-                y_train_only = y_target[:n_train].unsqueeze(1).unsqueeze(2)  # (n_train, 1, 1)
-
-                print(f"    [GRADIENT] X shape: {X_reshaped.shape}")
-                print(f"    [GRADIENT] y_train_only shape: {y_train_only.shape}")
-
-                # Use dictionary format
-                X_input = {"main": X_reshaped}
-                y_input = {"main": y_train_only}
-
-                try:
-                    print(f"    [GRADIENT] Calling model.forward with split data...")
-                    print(f"    [GRADIENT] single_eval_pos will be: {y_train_only.shape[0]}")
-                    print(f"    [GRADIENT] Model will predict samples {n_train} to {seq_len}")
-
-                    # Enable gradient computation
-                    X_grad = X_input["main"].clone().detach().requires_grad_(True)
-                    X_grad_dict = {"main": X_grad}
-
-                    # Call TabPFN's forward method
-                    output = model.forward(
-                        x=X_grad_dict,
-                        y=y_input,
-                        only_return_standard_out=True,
-                        force_recompute_layer=False,
-                    )
-
-                    print(f"    [GRADIENT] Forward pass completed!")
-                    print(f"    [GRADIENT] Output type: {type(output)}")
-
-                    # Handle different output formats
-                    if isinstance(output, dict):
-                        print(f"    [GRADIENT] Dict keys: {list(output.keys())}")
-                        y_pred_tensor = output.get("standard", next(iter(output.values())))
-                    elif isinstance(output, (list, tuple)):
-                        print(f"    [GRADIENT] List/tuple with {len(output)} elements")
-                        y_pred_tensor = output[0] if output else None
-                    else:
-                        y_pred_tensor = output
-
-                    print(f"    [GRADIENT] Prediction shape: {y_pred_tensor.shape if y_pred_tensor is not None else 'None'}")
-
-                    # Validate prediction
-                    if y_pred_tensor is None or y_pred_tensor.numel() == 0:
-                        print(f"    [GRADIENT] ✗ Empty prediction")
-                        return {}
-
-                    # Check prediction shape - should be (n_test, batch, n_out)
-                    if y_pred_tensor.shape[0] != n_test:
-                        print(f"    [GRADIENT] ⚠ Unexpected prediction shape: {y_pred_tensor.shape}")
-                        print(f"    [GRADIENT] Expected ~{n_test} predictions, got {y_pred_tensor.shape[0]}")
-
-                    # Check if we can backprop through the prediction
-                    if not y_pred_tensor.requires_grad:
-                        print(f"    [GRADIENT] ✗ Prediction detached from computation graph")
-                        return {}
-
-                    # Compute loss using predictions and corresponding targets
-                    # Use the last n_test targets (the ones we predicted)
-                    y_test_targets = y_target[n_train:n_train + y_pred_tensor.shape[0]]
-
-                    # Handle shape differences
-                    if y_pred_tensor.dim() == 3:  # (n_test, batch, n_out)
-                        y_pred_used = y_pred_tensor[:, 0, 0]  # Use first output dimension
-                    elif y_pred_tensor.dim() == 2:  # (n_test, n_out) or (n_test, batch)
-                        y_pred_used = y_pred_tensor[:, 0] if y_pred_tensor.shape[1] > 1 else y_pred_tensor.flatten()
-                    else:
-                        y_pred_used = y_pred_tensor.flatten()
-
-                    # Ensure shapes match
-                    min_len = min(y_pred_used.numel(), y_test_targets.numel())
-                    y_pred_used = y_pred_used[:min_len]
-                    y_test_targets = y_test_targets[:min_len]
-
-                    print(f"    [GRADIENT] Computing loss with {min_len} predictions")
-                    loss = torch.nn.functional.mse_loss(y_pred_used, y_test_targets)
-
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"    [GRADIENT] ✗ Loss is NaN/Inf")
-                        return {}
-
-                    print(f"    [GRADIENT] ✓ Computed loss: {loss.item():.6f}")
-
-                    # Backward pass to compute gradients w.r.t. attention outputs
-                    print(f"    [GRADIENT] Computing backward pass...")
-                    loss.backward()
-                    print(f"    [GRADIENT] ✓ Backward pass completed")
-
-                except Exception as e:
-                    print(f"    [GRADIENT] TabPFN forward/backward pass failed: {e}")
-                    import traceback
-                    print(f"    [GRADIENT] Traceback: {traceback.format_exc()}")
-
-                    # Forward pass failed - try alternative approach
-                    import warnings
-                    warnings.warn(
-                        f"TabPFN forward pass failed for gradient computation: {e}. "
-                        "Falling back to attention-based head importance."
-                    )
-                    return self._compute_attention_based_head_weights(attention_weights, device)
-            else:
-                # Not a TabPFN model - try generic approach
-                print(f"    [GRADIENT] Not a TabPFN model - trying generic approach...")
-                import warnings
-                warnings.warn(
-                    "Model architecture not recognized for gradient computation. "
-                    "Using attention-based head importance."
-                )
-                return self._compute_attention_based_head_weights(attention_weights, device)
-
-        except Exception as e:
+        is_tabpfn_model = (
+            hasattr(model, "forward")
+            and hasattr(model, "transformer_encoder")
+            and hasattr(model, "encoder")
+        )
+        if not is_tabpfn_model:
             import warnings
-            import traceback
-            print(f"    [GRADIENT] ERROR: {e}")
-            print(f"    [GRADIENT] Traceback: {traceback.format_exc()}")
             warnings.warn(
-                f"Gradient computation failed: {e}\n"
-                f"Traceback: {traceback.format_exc()}\n"
-                "Falling back to uniform head weights."
+                "Model architecture not recognized for gradient computation. "
+                "Using attention-based head importance."
             )
             return {}
-        finally:
-            # Always clean up hooks to prevent memory leaks
-            for hook in hooks:
-                try:
-                    hook.remove()
-                except Exception:
-                    pass  # Hook may already be removed or invalid
 
-        # Log gradient results
-        if gradients:
-            print(f"    [GRADIENT] ✓ Successfully computed gradients for {len(gradients)} layer(s):")
-            for key in sorted(gradients.keys()):
-                grad_shape = gradients[key].shape
-                print(f"      - {key}: shape {grad_shape}, mean {gradients[key].abs().mean().item():.6f}")
-        else:
-            print(f"    [GRADIENT] ✗ No gradients captured - will use fallback method")
-
-        return gradients
-
-    def _compute_attention_based_weights(self, encoder: Any) -> dict[str, torch.Tensor]:
-        """Compute head importance based on attention magnitude when gradients unavailable.
-
-        This fallback method uses attention weight magnitudes as a proxy for head importance,
-        providing better weighting than uniform weights.
-
-        Parameters
-        ----------
-        encoder : Any
-            Transformer encoder containing attention layers
-
-        Returns
-        -------
-        gradients : dict
-            Dictionary mapping layer_attn_type to magnitude-based proxy tensors
-        """
-        import warnings
-        warnings.warn("Using attention magnitude as proxy for gradient-based importance")
-
-        gradients = {}
-
+        # Collect attention modules and enable retain_grad mode
+        attn_modules: dict[str, Any] = {}
         for layer_idx, layer in enumerate(encoder.layers):
-            layer_key = str(layer_idx)
+            for attn_type in ("between_features", "between_items"):
+                attn_mod = getattr(layer, f"self_attn_{attn_type}", None)
+                if attn_mod is not None:
+                    attn_mod.enable_attention_grad_retention(True)
+                    key = f"layer_{layer_idx}_{attn_type}"
+                    attn_modules[key] = attn_mod
 
-            # Try to get attention weights directly
-            for attn_type in ["between_features", "between_items"]:
-                attn_module = getattr(layer, f"self_attn_{attn_type}", None)
-                if attn_module is not None and hasattr(attn_module, "get_attention_weights"):
-                    try:
-                        attn_weights = attn_module.get_attention_weights()
-                        if attn_weights is not None:
-                            # Use attention magnitude as gradient proxy
-                            # Higher average attention = more important head
-                            key = f"layer_{layer_key}_{attn_type}"
-                            # Average over batch and sequence, keep per-head
-                            if attn_weights.dim() >= 4:  # (batch, seq, seq, heads)
-                                gradients[key] = attn_weights.abs().mean(dim=(0, 1, 2))
-                            elif attn_weights.dim() == 3:  # (batch, seq, heads)
-                                gradients[key] = attn_weights.abs().mean(dim=(0, 1))
-                    except Exception:
-                        pass
+        model.eval()
+        prev_grad = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+
+        try:
+            seq_len, n_features = X.shape
+            n_train = max(1, int(seq_len * 0.8))
+
+            X_reshaped = X.unsqueeze(1)  # (seq_len, 1, n_features)
+            y_train_only = y_target[:n_train].unsqueeze(1).unsqueeze(2)
+
+            X_grad = X_reshaped.clone().detach().requires_grad_(True)
+
+            output = model.forward(
+                x={"main": X_grad},
+                y={"main": y_train_only},
+                only_return_standard_out=True,
+                force_recompute_layer=False,
+            )
+
+            # Extract prediction tensor
+            if isinstance(output, dict):
+                y_pred_tensor = output.get("standard", next(iter(output.values())))
+            elif isinstance(output, (list, tuple)):
+                y_pred_tensor = output[0] if output else None
+            else:
+                y_pred_tensor = output
+
+            if y_pred_tensor is None or y_pred_tensor.numel() == 0:
+                return {}
+            if not y_pred_tensor.requires_grad:
+                return {}
+
+            n_test = seq_len - n_train
+            y_test_targets = y_target[n_train : n_train + y_pred_tensor.shape[0]]
+
+            if y_pred_tensor.dim() == 3:
+                y_pred_used = y_pred_tensor[:, 0, 0]
+            elif y_pred_tensor.dim() == 2:
+                y_pred_used = y_pred_tensor[:, 0] if y_pred_tensor.shape[1] > 1 else y_pred_tensor.flatten()
+            else:
+                y_pred_used = y_pred_tensor.flatten()
+
+            min_len = min(y_pred_used.numel(), y_test_targets.numel())
+            loss = torch.nn.functional.mse_loss(
+                y_pred_used[:min_len], y_test_targets[:min_len]
+            )
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                return {}
+
+            loss.backward()
+
+            # Read .grad from each cached attention weight tensor
+            for key, attn_mod in attn_modules.items():
+                cached = attn_mod.get_attention_weights()
+                if cached is not None and cached.grad is not None:
+                    gradients[key] = cached.grad.detach().clone()
+
+        except Exception as e:
+            import traceback
+            import warnings
+            warnings.warn(
+                f"Gradient computation failed: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+        finally:
+            torch.set_grad_enabled(prev_grad)
+            # Disable retain_grad mode and clear caches
+            for attn_mod in attn_modules.values():
+                attn_mod.enable_attention_grad_retention(False)
+                attn_mod.enable_attention_weights_return(False)
 
         return gradients
 
@@ -1282,7 +1236,7 @@ class GradientAttentionExtractor(AttentionExtractor):
         Parameters
         ----------
         gradients : torch.Tensor
-            Gradient tensor
+            Gradient tensor of shape ``(batch, seq_q, seq_k, nheads)``.
         nheads : int
             Number of attention heads
         normalization : str
@@ -1293,50 +1247,25 @@ class GradientAttentionExtractor(AttentionExtractor):
         weights : torch.Tensor
             Normalized weights of shape (nheads,)
         """
-        # Aggregate gradients to get per-head scores
+        # Aggregate over batch, seq_q, seq_k → (nheads,)
         if normalization == "l1":
-            # L1 norm: sum of absolute values
-            head_scores = torch.abs(gradients).mean(dim=(0, 1, 2)).flatten()
+            head_scores = torch.abs(gradients).mean(dim=tuple(range(gradients.dim() - 1)))
         elif normalization == "l2":
-            # L2 norm: square root of sum of squares
             head_scores = torch.sqrt(
-                (gradients ** 2).mean(dim=(0, 1, 2)).flatten()
+                (gradients ** 2).mean(dim=tuple(range(gradients.dim() - 1)))
             )
         else:
             raise ValueError(f"Unknown normalization: {normalization}")
 
-        # Ensure we have the right number of weights
-        if head_scores.numel() >= nheads:
-            head_scores = head_scores[:nheads]
-        elif head_scores.numel() < nheads:
-            # Pad with small values if needed
-            padding = torch.zeros(nheads - head_scores.numel(), device=gradients.device)
-            head_scores = torch.cat([head_scores, padding + 1e-8])
+        assert head_scores.numel() == nheads, (
+            f"Expected {nheads} head scores, got {head_scores.numel()}. "
+            f"Gradient shape: {gradients.shape}"
+        )
 
         # Normalize to sum to 1
         weights = head_scores / (head_scores.sum() + 1e-8)
 
         return weights
-
-
-@contextmanager
-def _enable_gradient_computation():
-    """Context manager to temporarily enable gradient computation.
-
-    Yields
-    ------
-    None
-    """
-    # Store previous state
-    prev_grad_enabled = torch.is_grad_enabled()
-
-    try:
-        # Enable gradients
-        torch.set_grad_enabled(True)
-        yield
-    finally:
-        # Restore previous state
-        torch.set_grad_enabled(prev_grad_enabled)
 
 
 def compute_gradient_weighted_rollout(

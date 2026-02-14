@@ -23,6 +23,7 @@ from tabpfn.grn.attention_extractor import (
     AttentionExtractor,
     EdgeScoreComputer,
     GradientAttentionExtractor,
+    compute_kronecker_rollout_scores,
 )
 
 
@@ -105,6 +106,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         use_cross_validation: bool = False,
         n_folds: int = 5,
         random_state: int | None = 42,
+        use_kronecker: bool = True,
     ) -> None:
         """Initialize the TabPFNGRNRegressor.
 
@@ -135,6 +137,12 @@ class TabPFNGRNRegressor(BaseEstimator):
         random_state : int, default=42
             Random seed for reproducible cross-validation splits.
             Only used when use_cross_validation=True.
+        use_kronecker : bool, default=True
+            Whether to use memory-efficient Kronecker-factored rollout for
+            sequential_rollout and gradient_rollout strategies. When True,
+            avoids building the full N×N rollout matrix (O(M²F) instead of
+            O(M²F²) memory). Set to False to use the original full-matrix
+            rollout. Only affects rollout-based strategies.
         """
         self.tf_names = tf_names
         self.target_genes = target_genes
@@ -146,6 +154,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.use_cross_validation = use_cross_validation
         self.n_folds = n_folds
         self.random_state = random_state
+        self.use_kronecker = use_kronecker
 
         # Fitted attributes
         self.target_models_: dict[str, TabPFNRegressor] = {}
@@ -279,13 +288,110 @@ class TabPFNGRNRegressor(BaseEstimator):
 
                 # Extract attention weights
                 extractor = AttentionExtractor()
-                attention = extractor.extract(model, X, max_layers=1)
+                # Use all layers for rollout strategies; 1 layer otherwise
+                use_all_layers = self.edge_score_strategy in (
+                    "gradient_rollout", "sequential_rollout",
+                )
+                attention = extractor.extract(
+                    model, X, max_layers=None if use_all_layers else 1
+                )
                 self.attention_weights_[target_name] = attention
 
             # Compute edge scores
             self.edge_scores_ = self._compute_edge_scores()
 
         return self
+
+    def _rollout_edge_scores(
+        self,
+        attention: dict[str, dict[str, torch.Tensor]],
+        target_name: str,
+        head_weights: dict[str, dict[str, torch.Tensor]] | None = None,
+    ) -> dict[tuple[str, str], float]:
+        """Compute rollout-based edge scores.
+
+        Uses either memory-efficient Kronecker factorisation or the full
+        N×N rollout matrix depending on ``self.use_kronecker``.
+
+        Parameters
+        ----------
+        attention : dict
+            Per-layer attention weights for one target.
+        target_name : str
+            Name of the target gene.
+        head_weights : dict, optional
+            Gradient-based per-head weights (for gradient_rollout).
+
+        Returns
+        -------
+        edge_scores : dict
+            ``{(tf_name, target_name): score}`` for every TF.
+        """
+        from tabpfn.grn.attention_extractor import _extract_rollout_scores_vectorized
+
+        first_layer_key = sorted(
+            attention.keys(), key=lambda x: int(x.split("_")[1])
+        )[0]
+        first_layer_data = attention[first_layer_key]
+
+        if "between_items" in first_layer_data:
+            num_feature_blocks = first_layer_data["between_items"].size(1)
+        else:
+            num_feature_blocks = len(self.tf_names) + 1
+
+        target_idx = num_feature_blocks - 1
+        head_combination = "weighted" if head_weights else "mean"
+
+        if self.use_kronecker:
+            scores = compute_kronecker_rollout_scores(
+                attention,
+                target_idx=target_idx,
+                head_combination=head_combination,
+                head_weights=head_weights,
+                add_residual=True,
+            )
+
+            edge_scores: dict[tuple[str, str], float] = {}
+            for tf_idx, tf_name in enumerate(self.tf_names):
+                if tf_idx < target_idx:
+                    edge_scores[(tf_name, target_name)] = scores[tf_idx].item()
+                else:
+                    edge_scores[(tf_name, target_name)] = 0.0
+        else:
+            aggregation = "gradient_weighted" if head_weights else "sequential_rollout"
+            computer = EdgeScoreComputer(aggregation_method=aggregation)
+            rollout_matrix = computer.compute(
+                attention,
+                use_between_features=True,
+                use_between_items=True,
+                head_combination=head_combination,
+                head_weights=head_weights,
+                add_residual=True,
+                average_batch=True,
+            )
+
+            if "between_features" in first_layer_data:
+                num_items = first_layer_data["between_features"].size(1)
+            else:
+                raise ValueError("Cannot determine num_items from attention weights")
+
+            valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
+            edge_scores = {}
+
+            if valid_tf_indices:
+                tf_tensor = torch.tensor(
+                    valid_tf_indices, device=rollout_matrix.device, dtype=torch.long
+                )
+                mean_scores = _extract_rollout_scores_vectorized(
+                    rollout_matrix, tf_tensor, target_idx, num_items, num_feature_blocks
+                )
+                for idx, tf_idx in enumerate(valid_tf_indices):
+                    edge_scores[(self.tf_names[tf_idx], target_name)] = mean_scores[idx].item()
+
+            for tf_idx in range(target_idx, len(self.tf_names)):
+                edge_scores[(self.tf_names[tf_idx], target_name)] = 0.0
+
+        return edge_scores
 
     def _compute_edge_scores(self) -> dict[tuple[str, str], float]:
         """Compute edge scores from attention weights.
@@ -301,72 +407,11 @@ class TabPFNGRNRegressor(BaseEstimator):
         computer = EdgeScoreComputer(aggregation_method=self.attention_aggregation)
 
         for target_name, attention in self.attention_weights_.items():
-            # Handle sequential_rollout strategy separately
+            # Handle sequential_rollout strategy
             if self.edge_score_strategy == "sequential_rollout":
                 try:
-                    # Use sequential rollout with both attention types
-                    rollout_computer = EdgeScoreComputer(aggregation_method="sequential_rollout")
-                    rollout_matrix = rollout_computer.compute(
-                        attention,
-                        use_between_features=True,
-                        use_between_items=True,
-                        head_combination="mean",
-                        add_residual=True,
-                        average_batch=True,
-                    )
-
-                    # Extract edge scores from rollout matrix
-                    # rollout_matrix is (N, N) where N = num_items * num_feature_blocks
-                    # We need to determine num_items and num_feature_blocks from the attention
-                    first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
-                    first_layer_data = attention[first_layer_key]
-
-                    if "between_features" in first_layer_data:
-                        feat_attn = first_layer_data["between_features"]
-                        num_items = feat_attn.size(1)  # (batch, num_items, num_items, nheads)
-                    elif "between_items" in first_layer_data:
-                        item_attn = first_layer_data["between_items"]
-                        num_feature_blocks = item_attn.size(1)  # (batch, num_fblocks, num_fblocks, nheads)
-                    else:
-                        raise ValueError("Cannot determine dimensions from attention weights")
-
-                    # Get the other dimension
-                    if "between_items" in first_layer_data:
-                        num_feature_blocks = first_layer_data["between_items"].size(1)
-                    else:
-                        # Fallback: assume target is included in feature blocks
-                        num_feature_blocks = len(self.tf_names) + 1
-
-                    # Target position is the last feature block
-                    target_idx = num_feature_blocks - 1
-
-                    # Extract TF->Target edge scores from rollout matrix (VECTORIZED)
-                    # Get valid TF indices (those before target_idx)
-                    valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
-
-                    if valid_tf_indices:
-                        # Convert to tensor and extract scores using vectorized utility
-                        import torch
-                        from tabpfn.grn.attention_extractor import _extract_rollout_scores_vectorized
-
-                        device = rollout_matrix.device
-                        tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
-
-                        # Extract all scores at once
-                        mean_scores = _extract_rollout_scores_vectorized(
-                            rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
-                        )
-
-                        # Build edge_scores dictionary
-                        for idx, tf_idx in enumerate(valid_tf_indices):
-                            tf_name = self.tf_names[tf_idx]
-                            edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
-
-                    # Handle TFs with index >= target_idx (assign 0.0)
-                    for tf_idx in range(target_idx, len(self.tf_names)):
-                        tf_name = self.tf_names[tf_idx]
-                        edge_scores[(tf_name, target_name)] = 0.0
-
+                    target_scores = self._rollout_edge_scores(attention, target_name)
+                    edge_scores.update(target_scores)
                 except Exception as e:
                     import warnings
                     import traceback
@@ -379,177 +424,65 @@ class TabPFNGRNRegressor(BaseEstimator):
             # Handle gradient_rollout strategy with gradient-based head weighting
             if self.edge_score_strategy == "gradient_rollout":
                 try:
-                    from tabpfn.grn.attention_extractor import (
-                        GradientAttentionExtractor,
-                        _extract_rollout_scores_vectorized,
-                    )
-
-                    import torch
                     import numpy as np
 
-                    # Get the model and data for gradient computation
                     model = self.target_models_[target_name]
-
-                    # Use GradientAttentionExtractor to compute head weights
-                    # This computes gradients of target prediction w.r.t. attention weights
                     gradient_extractor = GradientAttentionExtractor()
 
-                    # For gradient computation, we need the target gene's y values
-                    # In TabPFN's in-context learning, each target has its own model
-                    # that predicts that specific target from TFs
-
-                    # Get y values for this target from the fitted data
-                    # Note: We need to access the original training data
                     if hasattr(self, 'X_') and hasattr(self, 'y_'):
-                        # Use original training data for gradient computation
                         X_grad = self.X_
-                        # Find the index of this target in target_genes
                         target_idx_in_y = self.target_genes.index(target_name)
                         y_target = self.y_[:, target_idx_in_y]
+                    elif hasattr(self, 'X_sample_') and hasattr(self, 'y_sample_'):
+                        X_grad = self.X_sample_
+                        target_idx_in_y = self.target_genes.index(target_name)
+                        y_target = self.y_sample_[:, target_idx_in_y]
                     else:
-                        # Fallback: use sample data if available
-                        if hasattr(self, 'X_sample_') and hasattr(self, 'y_sample_'):
-                            X_grad = self.X_sample_
-                            target_idx_in_y = self.target_genes.index(target_name)
-                            y_target = self.y_sample_[:, target_idx_in_y]
-                        else:
-                            # Last resort: create synthetic data for gradient computation
-                            # This won't give perfect gradients but provides a reasonable proxy
-                            X_grad = np.random.randn(10, len(self.tf_names))
-                            y_target = np.random.randn(10)
-                            import warnings
-                            warnings.warn(
-                                f"Using synthetic data for gradient computation for {target_name}. "
-                                "Results may be suboptimal."
-                            )
+                        X_grad = np.random.randn(10, len(self.tf_names))
+                        y_target = np.random.randn(10)
+                        import warnings
+                        warnings.warn(
+                            f"Using synthetic data for gradient computation for {target_name}. "
+                            "Results may be suboptimal."
+                        )
 
-                    # Convert to tensors if needed
                     if not isinstance(X_grad, torch.Tensor):
                         X_grad = torch.from_numpy(X_grad).float()
                     if not isinstance(y_target, torch.Tensor):
                         y_target = torch.from_numpy(y_target).float()
 
-                    # Ensure tensors are on the same device as the model
-                    # TabPFNRegressor stores devices in devices_ attribute (tuple)
                     if hasattr(model, 'devices_') and model.devices_:
-                        device = model.devices_[0]  # Get primary device
+                        device = model.devices_[0]
                         X_grad = X_grad.to(device)
                         y_target = y_target.to(device)
                     elif torch.cuda.is_available():
                         X_grad = X_grad.cuda()
                         y_target = y_target.cuda()
 
-                    # Compute gradient-based head weights
-                    # This uses the improved gradient computation that understands
-                    # TabPFN's in-context learning where X and y are concatenated
                     head_weights = gradient_extractor.compute_gradient_head_weights(
                         model=model,
                         X=X_grad,
                         y_target=y_target,
                         attention_weights=attention,
-                        normalization="l1"  # Use L1 norm for regression
+                        normalization="l1",
                     )
 
-                    # Compute gradient-weighted rollout
-                    rollout_computer = EdgeScoreComputer(aggregation_method="gradient_weighted")
-                    rollout_matrix = rollout_computer.compute(
-                        attention,
-                        use_between_features=True,
-                        use_between_items=True,
-                        head_weights=head_weights,  # Use computed gradient weights
-                        head_combination="weighted",
-                        add_residual=True,
-                        average_batch=True,
+                    target_scores = self._rollout_edge_scores(
+                        attention, target_name, head_weights=head_weights
                     )
-
-                    # Extract edge scores from rollout matrix (same as sequential_rollout)
-                    # Determine dimensions from attention weights
-                    first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
-                    first_layer_data = attention[first_layer_key]
-
-                    if "between_features" in first_layer_data:
-                        feat_attn = first_layer_data["between_features"]
-                        num_items = feat_attn.size(1)
-                    else:
-                        raise ValueError("Cannot determine dimensions from attention weights")
-
-                    if "between_items" in first_layer_data:
-                        num_feature_blocks = first_layer_data["between_items"].size(1)
-                    else:
-                        num_feature_blocks = len(self.tf_names) + 1
-
-                    target_idx = num_feature_blocks - 1
-
-                    # Extract TF->Target edge scores from rollout matrix (VECTORIZED)
-                    valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
-
-                    if valid_tf_indices:
-                        device = rollout_matrix.device
-                        tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
-
-                        mean_scores = _extract_rollout_scores_vectorized(
-                            rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
-                        )
-
-                        for idx, tf_idx in enumerate(valid_tf_indices):
-                            tf_name = self.tf_names[tf_idx]
-                            edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
-
-                    for tf_idx in range(target_idx, len(self.tf_names)):
-                        tf_name = self.tf_names[tf_idx]
-                        edge_scores[(tf_name, target_name)] = 0.0
+                    edge_scores.update(target_scores)
 
                 except Exception as e:
                     import warnings
                     import traceback
                     warnings.warn(f"Failed to extract edge scores for {target_name} with gradient_rollout: {e}\n{traceback.format_exc()}")
-                    # Fallback: use sequential rollout
+                    # Fallback: sequential rollout (unweighted)
                     try:
-                        rollout_computer = EdgeScoreComputer(aggregation_method="sequential_rollout")
-                        rollout_matrix = rollout_computer.compute(
-                            attention,
-                            use_between_features=True,
-                            use_between_items=True,
-                            add_residual=True,
-                            average_batch=True,
+                        target_scores = self._rollout_edge_scores(
+                            attention, target_name
                         )
-
-                        # Extract edge scores (same code as above)
-                        first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
-                        first_layer_data = attention[first_layer_key]
-
-                        if "between_features" in first_layer_data:
-                            feat_attn = first_layer_data["between_features"]
-                            num_items = feat_attn.size(1)
-                        else:
-                            raise ValueError("Cannot determine dimensions from attention weights")
-
-                        if "between_items" in first_layer_data:
-                            num_feature_blocks = first_layer_data["between_items"].size(1)
-                        else:
-                            num_feature_blocks = len(self.tf_names) + 1
-
-                        target_idx = num_feature_blocks - 1
-                        valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
-
-                        if valid_tf_indices:
-                            import torch
-                            device = rollout_matrix.device
-                            tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
-
-                            mean_scores = _extract_rollout_scores_vectorized(
-                                rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
-                            )
-
-                            for idx, tf_idx in enumerate(valid_tf_indices):
-                                tf_name = self.tf_names[tf_idx]
-                                edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
-
-                        for tf_idx in range(target_idx, len(self.tf_names)):
-                            tf_name = self.tf_names[tf_idx]
-                            edge_scores[(tf_name, target_name)] = 0.0
+                        edge_scores.update(target_scores)
                     except Exception:
-                        # Last resort: assign zero scores
                         for tf_name in self.tf_names:
                             edge_scores[(tf_name, target_name)] = 0.0
 
@@ -900,58 +833,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         # Handle sequential_rollout strategy
         if self.edge_score_strategy == "sequential_rollout":
             try:
-                from tabpfn.grn.attention_extractor import _extract_rollout_scores_vectorized
-
-                # Use sequential rollout with both attention types
-                rollout_computer = EdgeScoreComputer(aggregation_method="sequential_rollout")
-                rollout_matrix = rollout_computer.compute(
-                    attention,
-                    use_between_features=True,
-                    use_between_items=True,
-                    head_combination="mean",
-                    add_residual=True,
-                    average_batch=True,
-                )
-
-                # Determine dimensions from attention weights
-                first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
-                first_layer_data = attention[first_layer_key]
-
-                if "between_features" in first_layer_data:
-                    feat_attn = first_layer_data["between_features"]
-                    num_items = feat_attn.size(1)
-                elif "between_items" in first_layer_data:
-                    item_attn = first_layer_data["between_items"]
-                    num_feature_blocks = item_attn.size(1)
-                else:
-                    raise ValueError("Cannot determine dimensions from attention weights")
-
-                if "between_items" in first_layer_data:
-                    num_feature_blocks = first_layer_data["between_items"].size(1)
-                else:
-                    num_feature_blocks = len(self.tf_names) + 1
-
-                target_idx = num_feature_blocks - 1
-
-                # Extract TF->Target edge scores
-                valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
-
-                if valid_tf_indices:
-                    device = rollout_matrix.device
-                    tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
-
-                    mean_scores = _extract_rollout_scores_vectorized(
-                        rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
-                    )
-
-                    for idx, tf_idx in enumerate(valid_tf_indices):
-                        tf_name = self.tf_names[tf_idx]
-                        edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
-
-                for tf_idx in range(target_idx, len(self.tf_names)):
-                    tf_name = self.tf_names[tf_idx]
-                    edge_scores[(tf_name, target_name)] = 0.0
-
+                edge_scores = self._rollout_edge_scores(attention, target_name)
             except Exception as e:
                 import warnings
                 import traceback
@@ -962,10 +844,8 @@ class TabPFNGRNRegressor(BaseEstimator):
         # Handle gradient_rollout strategy
         elif self.edge_score_strategy == "gradient_rollout":
             if model is None:
-                # Fallback to sequential_rollout if model not provided
                 import warnings
                 warnings.warn(f"Model not provided for {target_name}, using sequential_rollout instead")
-                # Recursively call with sequential_rollout strategy
                 original_strategy = self.edge_score_strategy
                 self.edge_score_strategy = "sequential_rollout"
                 edge_scores = self._compute_edge_scores_from_attention(
@@ -975,15 +855,8 @@ class TabPFNGRNRegressor(BaseEstimator):
                 return edge_scores
 
             try:
-                from tabpfn.grn.attention_extractor import (
-                    GradientAttentionExtractor,
-                    _extract_rollout_scores_vectorized,
-                )
-
-                # Use GradientAttentionExtractor to compute head weights
                 gradient_extractor = GradientAttentionExtractor()
 
-                # Prepare data for gradient computation
                 X_grad = torch.from_numpy(X).float()
                 y_target_tensor = torch.from_numpy(y_target).float()
 
@@ -995,58 +868,17 @@ class TabPFNGRNRegressor(BaseEstimator):
                 X_grad = X_grad.to(device)
                 y_target_tensor = y_target_tensor.to(device)
 
-                # Compute gradient-based head weights
                 head_weights = gradient_extractor.compute_gradient_head_weights(
                     model=model,
                     X=X_grad,
                     y_target=y_target_tensor,
                     attention_weights=attention,
-                    normalization="l1"
+                    normalization="l1",
                 )
 
-                # Compute gradient-weighted rollout
-                rollout_computer = EdgeScoreComputer(aggregation_method="gradient_weighted")
-                rollout_matrix = rollout_computer.compute(
-                    attention,
-                    use_between_features=True,
-                    use_between_items=True,
-                    head_weights=head_weights,
-                    head_combination="weighted",
-                    add_residual=True,
-                    average_batch=True,
+                edge_scores = self._rollout_edge_scores(
+                    attention, target_name, head_weights=head_weights
                 )
-
-                # Determine dimensions
-                first_layer_key = sorted(attention.keys(), key=lambda x: int(x.split('_')[1]))[0]
-                first_layer_data = attention[first_layer_key]
-
-                if "between_features" in first_layer_data:
-                    num_items = first_layer_data["between_features"].size(1)
-                if "between_items" in first_layer_data:
-                    num_feature_blocks = first_layer_data["between_items"].size(1)
-                else:
-                    num_feature_blocks = len(self.tf_names) + 1
-
-                target_idx = num_feature_blocks - 1
-
-                # Extract TF->Target edge scores
-                valid_tf_indices = [i for i in range(len(self.tf_names)) if i < target_idx]
-
-                if valid_tf_indices:
-                    device = rollout_matrix.device
-                    tf_indices_tensor = torch.tensor(valid_tf_indices, device=device, dtype=torch.long)
-
-                    mean_scores = _extract_rollout_scores_vectorized(
-                        rollout_matrix, tf_indices_tensor, target_idx, num_items, num_feature_blocks
-                    )
-
-                    for idx, tf_idx in enumerate(valid_tf_indices):
-                        tf_name = self.tf_names[tf_idx]
-                        edge_scores[(tf_name, target_name)] = mean_scores[idx].item()
-
-                for tf_idx in range(target_idx, len(self.tf_names)):
-                    tf_name = self.tf_names[tf_idx]
-                    edge_scores[(tf_name, target_name)] = 0.0
 
             except Exception as e:
                 import warnings

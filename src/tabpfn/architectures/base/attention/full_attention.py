@@ -62,6 +62,7 @@ class MultiHeadAttention(Attention):
     softmax_scale: float | None
     _return_attention_weights: bool
     _cached_attention_weights: torch.Tensor | None
+    _retain_grad_for_attention: bool
     _k_cache: torch.Tensor | None
     _v_cache: torch.Tensor | None
     _kv_cache: torch.Tensor | None
@@ -125,6 +126,22 @@ class MultiHeadAttention(Attention):
         self._return_attention_weights = enable
         if not enable:
             self._cached_attention_weights = None
+
+    def enable_attention_grad_retention(self, enable: bool = True) -> None:
+        """Enable or disable gradient retention for cached attention weights.
+
+        When enabled, attention weights are cached without detaching from the
+        computation graph and ``retain_grad()`` is called so that gradients
+        can be read after ``loss.backward()``.
+
+        Parameters
+        ----------
+        enable : bool, default=True
+            Whether to retain gradients for attention weights.
+        """
+        self._retain_grad_for_attention = enable
+        if enable:
+            self._return_attention_weights = True
 
     def get_attention_weights(self) -> torch.Tensor | None:
         """Get cached attention weights from the last forward pass.
@@ -239,6 +256,7 @@ class MultiHeadAttention(Attention):
         self.init_gain = config.attention_init_gain
         self._return_attention_weights = return_attention_weights
         self._cached_attention_weights = None
+        self._retain_grad_for_attention = False
 
         w_out = torch.nn.Parameter(
             torch.empty(
@@ -544,7 +562,12 @@ class MultiHeadAttention(Attention):
 
         # Cache attention weights if enabled
         if self._return_attention_weights and attention_weights is not None:
-            self._cached_attention_weights = attention_weights.detach().clone()
+            if self._retain_grad_for_attention:
+                # Keep in computation graph for gradient computation
+                self._cached_attention_weights = attention_weights
+                attention_weights.retain_grad()
+            else:
+                self._cached_attention_weights = attention_weights.detach().clone()
 
         return torch.einsum(
             "... h d, h d s -> ... s",
