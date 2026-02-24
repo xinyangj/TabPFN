@@ -665,6 +665,21 @@ Examples:
     )
 
     parser.add_argument(
+        "--ig-n-folds",
+        type=int,
+        default=1,
+        help="Number of CV folds for Integrated Gradients (default: 1, no CV)"
+    )
+
+    parser.add_argument(
+        "--ig-baseline",
+        type=str,
+        default="zero",
+        choices=["zero", "mean"],
+        help="Baseline for Integrated Gradients (default: zero)"
+    )
+
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -900,6 +915,8 @@ def run_dataset_analysis(
         n_estimators=args.n_estimators,
         attention_aggregation="mean",
         edge_score_strategies=tabpfn_strategies,
+        ig_n_folds=args.ig_n_folds,
+        ig_baseline=args.ig_baseline,
     )
 
     for strategy, result in tabpfn_results.items():

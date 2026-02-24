@@ -110,6 +110,8 @@ class TabPFNGRNRegressor(BaseEstimator):
         n_folds: int = 5,
         random_state: int | None = 42,
         use_kronecker: bool = True,
+        ig_n_folds: int = 1,
+        ig_baseline: str = "zero",
     ) -> None:
         """Initialize the TabPFNGRNRegressor.
 
@@ -146,6 +148,15 @@ class TabPFNGRNRegressor(BaseEstimator):
             avoids building the full N×N rollout matrix (O(M²F) instead of
             O(M²F²) memory). Set to False to use the original full-matrix
             rollout. Only affects rollout-based strategies.
+        ig_n_folds : int, default=1
+            Number of cross-validation folds for Integrated Gradients.
+            When >1, rotates train/test splits and averages per-TF scores.
+            Only used when edge_score_strategy='integrated_gradients'.
+        ig_baseline : str, default='zero'
+            Baseline for Integrated Gradients interpolation.
+            ``'zero'``: all-zero vector (no TF expression).
+            ``'mean'``: per-feature mean of training samples in each fold.
+            Only used when edge_score_strategy='integrated_gradients'.
         """
         self.tf_names = tf_names
         self.target_genes = target_genes
@@ -158,6 +169,8 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.n_folds = n_folds
         self.random_state = random_state
         self.use_kronecker = use_kronecker
+        self.ig_n_folds = ig_n_folds
+        self.ig_baseline = ig_baseline
 
         # Fitted attributes
         self.target_models_: dict[str, TabPFNRegressor] = {}
@@ -440,7 +453,9 @@ class TabPFNGRNRegressor(BaseEstimator):
 
                 try:
                     target_scores = self._integrated_gradients_edge_scores(
-                        model, X_ig, y_target, target_name
+                        model, X_ig, y_target, target_name,
+                        ig_n_folds=self.ig_n_folds,
+                        baseline=self.ig_baseline,
                     )
                     edge_scores.update(target_scores)
                 except Exception as e:
@@ -941,7 +956,9 @@ class TabPFNGRNRegressor(BaseEstimator):
             )
             if model is not None:
                 edge_scores = self._integrated_gradients_edge_scores(
-                    model, X, y_target, target_name, n_train=n_train
+                    model, X, y_target, target_name, n_train=n_train,
+                    ig_n_folds=self.ig_n_folds,
+                    baseline=self.ig_baseline,
                 )
             else:
                 for tf_name in self.tf_names:
@@ -963,18 +980,14 @@ class TabPFNGRNRegressor(BaseEstimator):
         target_name: str,
         n_train: int | None = None,
         n_steps: int = 50,
+        ig_n_folds: int = 1,
+        baseline: str = "zero",
     ) -> dict[tuple[str, str], float]:
-        """Compute edge scores using Integrated Gradients.
+        """Compute edge scores using Integrated Gradients (batched on GPU).
 
-        Uses Integrated Gradients (Sundararajan et al., ICML 2017) to compute
-        feature attributions for each TF→target edge. Interpolates ALL input
-        features (both train and test samples) from a zero baseline to actual
-        values and averages gradients along the path.
-
-        TabPFN's forward pass takes ``[X_train | X_test]`` combined with
-        ``y_train`` only. Predictions are produced for test positions, but
-        gradients of those predictions flow back to ALL input positions,
-        capturing how each sample's TF expression contributes to predictions.
+        Uses TabPFN's batch dimension to run all interpolation steps (and
+        optionally all CV folds) in a single forward pass, achieving up to
+        ``n_steps * n_folds`` x speedup over the sequential version.
 
         Parameters
         ----------
@@ -987,10 +1000,15 @@ class TabPFNGRNRegressor(BaseEstimator):
         target_name : str
             Name of the target gene.
         n_train : int, optional
-            Number of training samples for the train/test split. If ``None``,
-            uses 80% of ``X``.
+            Number of training samples for the train/test split. Only used
+            when ``ig_n_folds=1``. If ``None``, uses 80% of ``X``.
         n_steps : int, default=50
             Number of interpolation steps along the path from baseline to input.
+        ig_n_folds : int, default=1
+            Number of cross-validation folds for IG. When >1, rotates the
+            train/test split across folds and averages the per-TF scores.
+        baseline : str, default="zero"
+            Baseline choice: ``"zero"`` or ``"mean"`` (per-fold training mean).
 
         Returns
         -------
@@ -1013,67 +1031,206 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         model_arch = model.models_[0]
 
-        # Determine device
         if hasattr(model, "devices_") and model.devices_:
             device = model.devices_[0]
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Split into train/test for TabPFN in-context learning
-        n_samples = X.shape[0]
-        if n_train is None:
-            n_train = max(1, int(n_samples * 0.8))
-        n_test = n_samples - n_train
+        n_samples, n_features = X.shape
 
-        if n_test < 1:
-            import warnings
-            warnings.warn(
-                f"Not enough samples for IG split (n={n_samples}). "
-                "Need at least 2 samples."
+        # Build list of (X_fold, y_fold_train, n_train_fold) for each fold
+        fold_specs: list[tuple[np.ndarray, np.ndarray, int]] = []
+
+        if ig_n_folds > 1:
+            from sklearn.model_selection import KFold
+            kfold = KFold(
+                n_splits=ig_n_folds, shuffle=True,
+                random_state=self.random_state,
             )
-            for tf_name in self.tf_names:
-                edge_scores[(tf_name, target_name)] = 0.0
-            return edge_scores
+            for train_idx, test_idx in kfold.split(X):
+                X_fold = np.concatenate([X[train_idx], X[test_idx]], axis=0)
+                y_fold_train = y_target[train_idx]
+                fold_specs.append((X_fold, y_fold_train, len(train_idx)))
+        else:
+            if n_train is None:
+                n_train = max(1, int(n_samples * 0.8))
+            if n_samples - n_train < 1:
+                import warnings
+                warnings.warn(
+                    f"Not enough samples for IG split (n={n_samples})."
+                )
+                for tf_name in self.tf_names:
+                    edge_scores[(tf_name, target_name)] = 0.0
+                return edge_scores
+            fold_specs.append((X, y_target[:n_train], n_train))
 
-        X_all = torch.from_numpy(X).float().to(device)  # (n_samples, n_TFs)
-        y_train = (
-            torch.from_numpy(y_target[:n_train])
-            .float()
-            .to(device)
-            .unsqueeze(1)
-            .unsqueeze(2)
-        )  # (n_train, 1, 1)
+        # Group folds by n_train (single_eval_pos must be same within a batch)
+        from collections import defaultdict
+        groups: dict[int, list[int]] = defaultdict(list)
+        for fold_idx, (_, _, nt) in enumerate(fold_specs):
+            groups[nt].append(fold_idx)
 
-        # Baseline is zero (no TF expression)
-        baseline = torch.zeros_like(X_all)
+        accumulated_scores = np.zeros(n_features)
+
+        for group_n_train, fold_indices in groups.items():
+            group_scores = self._ig_batched(
+                model_arch, device, fold_specs, fold_indices,
+                group_n_train, n_steps, baseline,
+            )
+            # group_scores shape: (n_folds_in_group, n_features)
+            accumulated_scores += group_scores.sum(axis=0)
+
+        tf_scores = accumulated_scores / len(fold_specs)
+
+        for tf_idx, tf_name in enumerate(self.tf_names):
+            edge_scores[(tf_name, target_name)] = float(tf_scores[tf_idx])
+
+        return edge_scores
+
+    def _ig_batched(
+        self,
+        model_arch: torch.nn.Module,
+        device: torch.device,
+        fold_specs: list[tuple[np.ndarray, np.ndarray, int]],
+        fold_indices: list[int],
+        n_train: int,
+        n_steps: int,
+        baseline_type: str,
+        max_batch: int | None = None,
+    ) -> np.ndarray:
+        """Run batched IG for folds that share the same ``n_train``.
+
+        Stacks all ``n_steps * len(fold_indices)`` interpolation points along
+        TabPFN's batch dimension and runs a single forward + backward pass,
+        exploiting GPU parallelism.
+
+        Parameters
+        ----------
+        model_arch : torch.nn.Module
+            The underlying TabPFN architecture.
+        device : torch.device
+            Computation device.
+        fold_specs : list of (X_fold, y_fold_train, n_train)
+            All fold specifications (only those in ``fold_indices`` are used).
+        fold_indices : list of int
+            Indices into ``fold_specs`` for folds in this group.
+        n_train : int
+            Number of training samples (same for all folds in this group).
+        n_steps : int
+            Number of IG interpolation steps.
+        baseline_type : str
+            ``"zero"`` or ``"mean"``.
+        max_batch : int or None
+            Maximum batch size to avoid CUDA OOM. If ``None``, automatically
+            estimated from available GPU memory. Larger batches are chunked.
+
+        Returns
+        -------
+        fold_scores : np.ndarray
+            Shape ``(len(fold_indices), n_features)`` — per-TF IG scores per fold.
+        """
+        import torch
+
+        n_folds = len(fold_indices)
+        seq_len = fold_specs[fold_indices[0]][0].shape[0]
+        n_features = fold_specs[fold_indices[0]][0].shape[1]
+        total_batch = n_folds * n_steps
+        # Avoid alpha=0 which creates all-zero inputs that break gradient
+        # flow through TabPFN's feature normalization layers.
+        alphas = torch.linspace(1e-6, 1, n_steps, device=device)
+
+        # Auto-detect safe batch size from available GPU memory.
+        # Attention memory scales as O(batch * seq_len^2 * n_heads * n_layers).
+        # Use a conservative heuristic: ~2 MB per batch item for seq_len~100.
+        if max_batch is None:
+            if device.type == "cuda":
+                try:
+                    free_mem = torch.cuda.mem_get_info(device)[0]
+                    # Reserve 512MB for overhead; ~2MB per batch item
+                    max_batch = max(1, int((free_mem - 512 * 1024**2) / (2 * 1024**2)))
+                    max_batch = min(max_batch, 200)  # cap for safety
+                except Exception:
+                    max_batch = 32
+            else:
+                max_batch = total_batch  # CPU: no limit
+
+        # Pre-compute per-fold tensors
+        X_folds = []      # (n_folds, seq_len, n_features)
+        baselines = []     # (n_folds, seq_len, n_features)
+        y_trains = []      # (n_folds, n_train)
+        for fi in fold_indices:
+            X_f, y_f_train, _ = fold_specs[fi]
+            X_t = torch.from_numpy(X_f).float().to(device)
+            X_folds.append(X_t)
+
+            if baseline_type == "mean":
+                train_mean = X_t[:n_train].mean(dim=0, keepdim=True)
+                baselines.append(train_mean.expand_as(X_t))
+            else:
+                baselines.append(torch.zeros_like(X_t))
+
+            y_trains.append(
+                torch.from_numpy(y_f_train).float().to(device)
+            )
+
+        # Stack into tensors: (n_folds, seq_len, n_features)
+        X_stack = torch.stack(X_folds)        # (F, S, D)
+        B_stack = torch.stack(baselines)      # (F, S, D)
+        delta = X_stack - B_stack             # (F, S, D)
 
         model_arch.eval()
         prev_grad = torch.is_grad_enabled()
         torch.set_grad_enabled(True)
 
         try:
-            # Accumulate gradients for ALL positions across interpolation steps
-            accumulated_grads = torch.zeros_like(X_all)  # (n_samples, n_TFs)
+            # Accumulate gradients across chunks
+            # We need: mean_grad per fold = sum(grad_at_alpha) / n_steps
+            # IG per fold = delta * mean_grad
+            # score per fold = mean(|IG|, dim=samples)
+            accumulated_grads = torch.zeros(
+                n_folds, seq_len, n_features, device=device
+            )
 
-            alphas = torch.linspace(0, 1, n_steps, device=device)
+            # Process in chunks, halving batch on OOM
+            steps_per_chunk = min(n_steps, max(1, max_batch // n_folds))
 
-            for alpha in alphas:
-                # Interpolate ALL samples from baseline to actual values
-                X_interp = baseline + alpha * (X_all - baseline)
+            s_start = 0
+            while s_start < n_steps:
+                s_end = min(s_start + steps_per_chunk, n_steps)
+                chunk_steps = s_end - s_start
+                chunk_batch = n_folds * chunk_steps
 
-                X_input = X_interp.unsqueeze(1)  # (n_samples, 1, n_TFs)
-                X_input = X_input.clone().detach().requires_grad_(True)
+                alpha_expanded = alphas[s_start:s_end].reshape(
+                    1, 1, chunk_steps, 1
+                )
+                delta_exp = delta.unsqueeze(2)
+                B_exp = B_stack.unsqueeze(2)
 
-                # Forward: y_train sets single_eval_pos = n_train
-                # Predictions are for test positions [n_train:] only
-                # but gradients flow back to ALL input positions
-                output = model_arch.forward(
-                    x={"main": X_input},
-                    y={"main": y_train},
-                    only_return_standard_out=True,
+                interp = B_exp + alpha_expanded * delta_exp
+                interp = interp.permute(1, 0, 2, 3).reshape(
+                    seq_len, chunk_batch, n_features
                 )
 
-                # Extract predictions
+                X_input = interp.clone().detach().requires_grad_(True)
+
+                y_parts = []
+                for fi_local in range(n_folds):
+                    y_f = y_trains[fi_local].unsqueeze(1).unsqueeze(2)
+                    y_parts.append(y_f.expand(n_train, chunk_steps, 1))
+                y_input = torch.cat(y_parts, dim=1)
+
+                try:
+                    output = model_arch.forward(
+                        x={"main": X_input},
+                        y={"main": y_input},
+                        only_return_standard_out=True,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    # Halve chunk size and retry this chunk
+                    torch.cuda.empty_cache()
+                    steps_per_chunk = max(1, steps_per_chunk // 2)
+                    continue
+
                 if isinstance(output, dict):
                     y_pred = output.get(
                         "standard", next(iter(output.values()))
@@ -1084,42 +1241,46 @@ class TabPFNGRNRegressor(BaseEstimator):
                     y_pred = output
 
                 if y_pred is None or y_pred.numel() == 0:
+                    s_start = s_end
                     continue
                 if not y_pred.requires_grad:
+                    s_start = s_end
                     continue
 
-                # y_pred shape: (n_test, 1, 1) — sum for scalar backward
                 pred_sum = y_pred.sum()
-                pred_sum.backward()
+                try:
+                    pred_sum.backward()
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    steps_per_chunk = max(1, steps_per_chunk // 2)
+                    continue
 
                 if X_input.grad is not None:
-                    # Collect gradients for ALL positions (train + test)
-                    all_grads = X_input.grad[:, 0, :]  # (n_samples, n_TFs)
-                    accumulated_grads += all_grads.detach()
+                    grad = X_input.grad.detach()
+                    grad = grad.reshape(
+                        seq_len, n_folds, chunk_steps, n_features
+                    )
+                    accumulated_grads += grad.sum(dim=2).permute(1, 0, 2)
 
-            # IG = (X - baseline) × mean(grads across steps)
-            mean_grads = accumulated_grads / n_steps
-            ig_attributions = (X_all - baseline) * mean_grads  # (n_samples, n_TFs)
+                s_start = s_end
 
-            # Per-TF score: mean(|IG|) across ALL samples
-            tf_scores = ig_attributions.abs().mean(dim=0)  # (n_TFs,)
-
-            for tf_idx, tf_name in enumerate(self.tf_names):
-                edge_scores[(tf_name, target_name)] = tf_scores[tf_idx].item()
+            # IG = delta * mean_grad_over_steps
+            mean_grads = accumulated_grads / n_steps  # (F, S, D)
+            ig = delta * mean_grads                    # (F, S, D)
+            # Per-fold score = mean(|IG|) over samples
+            fold_scores = ig.abs().mean(dim=1).cpu().numpy()  # (F, D)
 
         except Exception as e:
             import traceback
             import warnings
             warnings.warn(
-                f"Integrated Gradients failed for {target_name}: {e}\n"
-                f"{traceback.format_exc()}"
+                f"Batched IG failed: {e}\n{traceback.format_exc()}"
             )
-            for tf_name in self.tf_names:
-                edge_scores[(tf_name, target_name)] = 0.0
+            fold_scores = np.zeros((n_folds, n_features))
         finally:
             torch.set_grad_enabled(prev_grad)
 
-        return edge_scores
+        return fold_scores
 
     def cleanup_model(self, target_name: str | None = None) -> None:
         """Delete the fitted TabPFN model to free GPU memory.

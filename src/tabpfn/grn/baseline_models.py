@@ -513,6 +513,8 @@ class TabPFNWrapper:
         device: str = "auto",
         random_state: int = 42,
         keep_model: bool = False,
+        ig_n_folds: int = 1,
+        ig_baseline: str = "zero",
     ):
         self.n_estimators = n_estimators
         self.attention_aggregation = attention_aggregation
@@ -520,6 +522,8 @@ class TabPFNWrapper:
         self.device = device
         self.random_state = random_state
         self.keep_model = keep_model
+        self.ig_n_folds = ig_n_folds
+        self.ig_baseline = ig_baseline
         # Store individual regressors (one per target gene)
         self._regressors: dict[str, Any] = {}
         # Store fit parameters for prediction
@@ -572,6 +576,8 @@ class TabPFNWrapper:
             edge_score_strategy=self.edge_score_strategy,
             device=self.device,
             random_state=self.random_state,
+            ig_n_folds=self.ig_n_folds,
+            ig_baseline=self.ig_baseline,
         )
 
         # Fit on the target-specific features

@@ -360,6 +360,8 @@ class GRNBaselineRunner:
         random_state: int = 42,
         attention_aggregation: str = "mean",
         edge_score_strategies: list[str] | None = None,
+        ig_n_folds: int = 1,
+        ig_baseline: str = "zero",
     ) -> dict[str, dict]:
         """Run TabPFN with multiple edge score strategies using per-target processing.
 
@@ -433,6 +435,8 @@ class GRNBaselineRunner:
             device="auto",
             random_state=random_state,
             keep_model=True,  # Keep model for edge score extraction, cleanup manually
+            ig_n_folds=ig_n_folds,
+            ig_baseline=ig_baseline,
         )
 
         # Initialize edge score dictionaries for each strategy
