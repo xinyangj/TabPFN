@@ -930,20 +930,22 @@ class TabPFNGRNRegressor(BaseEstimator):
                 for tf_name in self.tf_names:
                     edge_scores[(tf_name, target_name)] = 0.0
 
-        # Handle integrated_gradients strategy
+        # Handle integrated_gradients strategy — not attention-based,
+        # should be dispatched via _compute_edge_scores() instead
         elif self.edge_score_strategy == "integrated_gradients":
-            if model is None:
-                import warnings
-                warnings.warn(
-                    f"Model not provided for {target_name}, "
-                    "cannot compute integrated_gradients."
-                )
-                for tf_name in self.tf_names:
-                    edge_scores[(tf_name, target_name)] = 0.0
-            else:
+            import warnings
+            warnings.warn(
+                "integrated_gradients should not be called via "
+                "_compute_edge_scores_from_attention(). Use "
+                "_compute_edge_scores() instead."
+            )
+            if model is not None:
                 edge_scores = self._integrated_gradients_edge_scores(
                     model, X, y_target, target_name, n_train=n_train
                 )
+            else:
+                for tf_name in self.tf_names:
+                    edge_scores[(tf_name, target_name)] = 0.0
 
         else:
             # Handle other edge score strategies (self_attention, tf_to_target, etc.)
@@ -965,9 +967,14 @@ class TabPFNGRNRegressor(BaseEstimator):
         """Compute edge scores using Integrated Gradients.
 
         Uses Integrated Gradients (Sundararajan et al., ICML 2017) to compute
-        feature attributions for each TF→target edge. Interpolates test features
-        from a zero baseline to the actual values and averages gradients along
-        the path.
+        feature attributions for each TF→target edge. Interpolates ALL input
+        features (both train and test samples) from a zero baseline to actual
+        values and averages gradients along the path.
+
+        TabPFN's forward pass takes ``[X_train | X_test]`` combined with
+        ``y_train`` only. Predictions are produced for test positions, but
+        gradients of those predictions flow back to ALL input positions,
+        capturing how each sample's TF expression contributes to predictions.
 
         Parameters
         ----------
@@ -1012,7 +1019,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Split into train/test
+        # Split into train/test for TabPFN in-context learning
         n_samples = X.shape[0]
         if n_train is None:
             n_train = max(1, int(n_samples * 0.8))
@@ -1028,8 +1035,7 @@ class TabPFNGRNRegressor(BaseEstimator):
                 edge_scores[(tf_name, target_name)] = 0.0
             return edge_scores
 
-        X_train = torch.from_numpy(X[:n_train]).float().to(device)
-        X_test = torch.from_numpy(X[n_train:]).float().to(device)
+        X_all = torch.from_numpy(X).float().to(device)  # (n_samples, n_TFs)
         y_train = (
             torch.from_numpy(y_target[:n_train])
             .float()
@@ -1039,29 +1045,28 @@ class TabPFNGRNRegressor(BaseEstimator):
         )  # (n_train, 1, 1)
 
         # Baseline is zero (no TF expression)
-        baseline = torch.zeros_like(X_test)
+        baseline = torch.zeros_like(X_all)
 
         model_arch.eval()
         prev_grad = torch.is_grad_enabled()
         torch.set_grad_enabled(True)
 
         try:
-            # Accumulate gradients across interpolation steps
-            accumulated_grads = torch.zeros_like(X_test)  # (n_test, n_TFs)
+            # Accumulate gradients for ALL positions across interpolation steps
+            accumulated_grads = torch.zeros_like(X_all)  # (n_samples, n_TFs)
 
             alphas = torch.linspace(0, 1, n_steps, device=device)
 
             for alpha in alphas:
-                # Interpolated test features
-                X_test_interp = baseline + alpha * (X_test - baseline)
+                # Interpolate ALL samples from baseline to actual values
+                X_interp = baseline + alpha * (X_all - baseline)
 
-                # Combine train + interpolated test
-                X_combined = torch.cat(
-                    [X_train, X_test_interp], dim=0
-                )  # (n_samples, n_TFs)
-                X_input = X_combined.unsqueeze(1)  # (seq_len, 1, n_TFs)
+                X_input = X_interp.unsqueeze(1)  # (n_samples, 1, n_TFs)
                 X_input = X_input.clone().detach().requires_grad_(True)
 
+                # Forward: y_train sets single_eval_pos = n_train
+                # Predictions are for test positions [n_train:] only
+                # but gradients flow back to ALL input positions
                 output = model_arch.forward(
                     x={"main": X_input},
                     y={"main": y_train},
@@ -1083,20 +1088,20 @@ class TabPFNGRNRegressor(BaseEstimator):
                 if not y_pred.requires_grad:
                     continue
 
-                # y_pred shape: (n_test, 1, 1) — squeeze to scalar sum
+                # y_pred shape: (n_test, 1, 1) — sum for scalar backward
                 pred_sum = y_pred.sum()
                 pred_sum.backward()
 
                 if X_input.grad is not None:
-                    # Extract gradients for test positions only
-                    test_grads = X_input.grad[n_train:, 0, :]  # (n_test, n_TFs)
-                    accumulated_grads += test_grads.detach()
+                    # Collect gradients for ALL positions (train + test)
+                    all_grads = X_input.grad[:, 0, :]  # (n_samples, n_TFs)
+                    accumulated_grads += all_grads.detach()
 
-            # IG = (X_test - baseline) × mean(grads)
+            # IG = (X - baseline) × mean(grads across steps)
             mean_grads = accumulated_grads / n_steps
-            ig_attributions = (X_test - baseline) * mean_grads  # (n_test, n_TFs)
+            ig_attributions = (X_all - baseline) * mean_grads  # (n_samples, n_TFs)
 
-            # Per-TF score: mean(|IG|) across test samples
+            # Per-TF score: mean(|IG|) across ALL samples
             tf_scores = ig_attributions.abs().mean(dim=0)  # (n_TFs,)
 
             for tf_idx, tf_name in enumerate(self.tf_names):
