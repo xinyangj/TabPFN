@@ -651,9 +651,10 @@ Examples:
         "--strategies",
         nargs="+",
         choices=["self_attention", "tf_to_target", "target_to_tf", "combined",
-                 "combined_best", "sequential_rollout", "gradient_rollout"],
+                 "combined_best", "sequential_rollout", "gradient_rollout",
+                 "integrated_gradients"],
         default=None,
-        help="TabPFN edge score strategies to test (default: all 7 strategies)"
+        help="TabPFN edge score strategies to test (default: all 8 strategies)"
     )
 
     parser.add_argument(
@@ -1023,6 +1024,7 @@ def main() -> None:
             "combined_best",
             "sequential_rollout",
             "gradient_rollout",
+            "integrated_gradients",
         ]
 
     # Print configuration

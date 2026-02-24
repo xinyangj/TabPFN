@@ -394,9 +394,9 @@ class GRNBaselineRunner:
             Method to aggregate attention
         edge_score_strategies : list[str], optional
             List of edge score strategies to evaluate.
-            If None, uses all 7 strategies: ['self_attention', 'tf_to_target',
+            If None, uses all 8 strategies: ['self_attention', 'tf_to_target',
             'target_to_tf', 'combined', 'combined_best', 'sequential_rollout',
-            'gradient_rollout']
+            'gradient_rollout', 'integrated_gradients']
 
         Returns
         -------
@@ -409,7 +409,8 @@ class GRNBaselineRunner:
         if edge_score_strategies is None:
             edge_score_strategies = [
                 'self_attention', 'tf_to_target', 'target_to_tf',
-                'combined', 'combined_best', 'sequential_rollout', 'gradient_rollout'
+                'combined', 'combined_best', 'sequential_rollout',
+                'gradient_rollout', 'integrated_gradients'
             ]
 
         # 1. Prepare data using unified pipeline

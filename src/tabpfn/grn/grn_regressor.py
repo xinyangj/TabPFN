@@ -67,6 +67,9 @@ class TabPFNGRNRegressor(BaseEstimator):
         - 'gradient_rollout': Use gradient-weighted attention rollout that computes
           per-head importance using gradient information and weights attention accordingly
           (new, state-of-the-art approach adapted from GMAR for regression)
+        - 'integrated_gradients': Use Integrated Gradients (Sundararajan et al., 2017) to
+          compute feature attributions via gradient interpolation from a zero baseline.
+          Captures causal feature importance rather than attention routing patterns.
 
     device : str, default='auto'
         Device to use for computation ('auto', 'cpu', 'cuda')
@@ -286,16 +289,17 @@ class TabPFNGRNRegressor(BaseEstimator):
                 # Log pre-trained weight loading information
                 self._log_model_info(model, target_name)
 
-                # Extract attention weights
-                extractor = AttentionExtractor()
-                # Use all layers for rollout strategies; 1 layer otherwise
-                use_all_layers = self.edge_score_strategy in (
-                    "gradient_rollout", "sequential_rollout",
-                )
-                attention = extractor.extract(
-                    model, X, max_layers=None if use_all_layers else 1
-                )
-                self.attention_weights_[target_name] = attention
+                # Extract attention weights (not needed for integrated_gradients)
+                if self.edge_score_strategy != "integrated_gradients":
+                    extractor = AttentionExtractor()
+                    # Use all layers for rollout strategies; 1 layer otherwise
+                    use_all_layers = self.edge_score_strategy in (
+                        "gradient_rollout", "sequential_rollout",
+                    )
+                    attention = extractor.extract(
+                        model, X, max_layers=None if use_all_layers else 1
+                    )
+                    self.attention_weights_[target_name] = attention
 
             # Compute edge scores
             self.edge_scores_ = self._compute_edge_scores()
@@ -409,6 +413,48 @@ class TabPFNGRNRegressor(BaseEstimator):
         import torch
 
         edge_scores = {}
+
+        # Integrated gradients doesn't use attention weights —
+        # iterate over target_models_ instead
+        if self.edge_score_strategy == "integrated_gradients":
+            for target_name in self.target_genes:
+                if target_name not in self.target_models_:
+                    for tf_name in self.tf_names:
+                        edge_scores[(tf_name, target_name)] = 0.0
+                    continue
+
+                model = self.target_models_[target_name]
+
+                if hasattr(self, 'X_') and hasattr(self, 'y_'):
+                    X_ig = self.X_
+                    target_idx_in_y = self.target_genes.index(target_name)
+                    y_target = self.y_[:, target_idx_in_y]
+                else:
+                    import warnings
+                    warnings.warn(
+                        f"Training data not available for IG on {target_name}."
+                    )
+                    for tf_name in self.tf_names:
+                        edge_scores[(tf_name, target_name)] = 0.0
+                    continue
+
+                try:
+                    target_scores = self._integrated_gradients_edge_scores(
+                        model, X_ig, y_target, target_name
+                    )
+                    edge_scores.update(target_scores)
+                except Exception as e:
+                    import warnings
+                    import traceback
+                    warnings.warn(
+                        f"Failed integrated_gradients for {target_name}: {e}\n"
+                        f"{traceback.format_exc()}"
+                    )
+                    for tf_name in self.tf_names:
+                        edge_scores[(tf_name, target_name)] = 0.0
+
+            return edge_scores
+
         computer = EdgeScoreComputer(aggregation_method=self.attention_aggregation)
 
         for target_name, attention in self.attention_weights_.items():
@@ -698,7 +744,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         edge_score_strategy : str, optional
             Edge score strategy to use. If None, uses the strategy from __init__.
             Options: 'self_attention', 'tf_to_target', 'target_to_tf', 'sequential_rollout',
-                     'gradient_rollout', 'combined', 'combined_best'
+                     'gradient_rollout', 'integrated_gradients', 'combined', 'combined_best'
             This allows computing different edge score strategies without re-fitting.
 
         Returns
@@ -732,7 +778,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         edge_score_strategy : str
             Edge score strategy to use
             Options: 'self_attention', 'tf_to_target', 'target_to_tf', 'sequential_rollout',
-                     'gradient_rollout', 'combined', 'combined_best'
+                     'gradient_rollout', 'integrated_gradients', 'combined', 'combined_best'
 
         Returns
         -------
@@ -884,11 +930,189 @@ class TabPFNGRNRegressor(BaseEstimator):
                 for tf_name in self.tf_names:
                     edge_scores[(tf_name, target_name)] = 0.0
 
+        # Handle integrated_gradients strategy
+        elif self.edge_score_strategy == "integrated_gradients":
+            if model is None:
+                import warnings
+                warnings.warn(
+                    f"Model not provided for {target_name}, "
+                    "cannot compute integrated_gradients."
+                )
+                for tf_name in self.tf_names:
+                    edge_scores[(tf_name, target_name)] = 0.0
+            else:
+                edge_scores = self._integrated_gradients_edge_scores(
+                    model, X, y_target, target_name, n_train=n_train
+                )
+
         else:
             # Handle other edge score strategies (self_attention, tf_to_target, etc.)
             # For simplicity, assign uniform scores or use the aggregation computer
             for tf_name in self.tf_names:
                 edge_scores[(tf_name, target_name)] = 0.0
+
+        return edge_scores
+
+    def _integrated_gradients_edge_scores(
+        self,
+        model: TabPFNRegressor,
+        X: np.ndarray,
+        y_target: np.ndarray,
+        target_name: str,
+        n_train: int | None = None,
+        n_steps: int = 50,
+    ) -> dict[tuple[str, str], float]:
+        """Compute edge scores using Integrated Gradients.
+
+        Uses Integrated Gradients (Sundararajan et al., ICML 2017) to compute
+        feature attributions for each TF→target edge. Interpolates test features
+        from a zero baseline to the actual values and averages gradients along
+        the path.
+
+        Parameters
+        ----------
+        model : TabPFNRegressor
+            Fitted TabPFN model for this target gene.
+        X : np.ndarray
+            Input data of shape ``(n_samples, n_TFs)``.
+        y_target : np.ndarray
+            Target gene expression of shape ``(n_samples,)``.
+        target_name : str
+            Name of the target gene.
+        n_train : int, optional
+            Number of training samples for the train/test split. If ``None``,
+            uses 80% of ``X``.
+        n_steps : int, default=50
+            Number of interpolation steps along the path from baseline to input.
+
+        Returns
+        -------
+        edge_scores : dict
+            ``{(tf_name, target_name): score}`` for every TF.
+        """
+        import torch
+
+        edge_scores: dict[tuple[str, str], float] = {}
+
+        if not hasattr(model, "models_") or not model.models_:
+            import warnings
+            warnings.warn(
+                f"Model for {target_name} has no underlying architecture "
+                "for Integrated Gradients computation."
+            )
+            for tf_name in self.tf_names:
+                edge_scores[(tf_name, target_name)] = 0.0
+            return edge_scores
+
+        model_arch = model.models_[0]
+
+        # Determine device
+        if hasattr(model, "devices_") and model.devices_:
+            device = model.devices_[0]
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Split into train/test
+        n_samples = X.shape[0]
+        if n_train is None:
+            n_train = max(1, int(n_samples * 0.8))
+        n_test = n_samples - n_train
+
+        if n_test < 1:
+            import warnings
+            warnings.warn(
+                f"Not enough samples for IG split (n={n_samples}). "
+                "Need at least 2 samples."
+            )
+            for tf_name in self.tf_names:
+                edge_scores[(tf_name, target_name)] = 0.0
+            return edge_scores
+
+        X_train = torch.from_numpy(X[:n_train]).float().to(device)
+        X_test = torch.from_numpy(X[n_train:]).float().to(device)
+        y_train = (
+            torch.from_numpy(y_target[:n_train])
+            .float()
+            .to(device)
+            .unsqueeze(1)
+            .unsqueeze(2)
+        )  # (n_train, 1, 1)
+
+        # Baseline is zero (no TF expression)
+        baseline = torch.zeros_like(X_test)
+
+        model_arch.eval()
+        prev_grad = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+
+        try:
+            # Accumulate gradients across interpolation steps
+            accumulated_grads = torch.zeros_like(X_test)  # (n_test, n_TFs)
+
+            alphas = torch.linspace(0, 1, n_steps, device=device)
+
+            for alpha in alphas:
+                # Interpolated test features
+                X_test_interp = baseline + alpha * (X_test - baseline)
+
+                # Combine train + interpolated test
+                X_combined = torch.cat(
+                    [X_train, X_test_interp], dim=0
+                )  # (n_samples, n_TFs)
+                X_input = X_combined.unsqueeze(1)  # (seq_len, 1, n_TFs)
+                X_input = X_input.clone().detach().requires_grad_(True)
+
+                output = model_arch.forward(
+                    x={"main": X_input},
+                    y={"main": y_train},
+                    only_return_standard_out=True,
+                )
+
+                # Extract predictions
+                if isinstance(output, dict):
+                    y_pred = output.get(
+                        "standard", next(iter(output.values()))
+                    )
+                elif isinstance(output, (list, tuple)):
+                    y_pred = output[0]
+                else:
+                    y_pred = output
+
+                if y_pred is None or y_pred.numel() == 0:
+                    continue
+                if not y_pred.requires_grad:
+                    continue
+
+                # y_pred shape: (n_test, 1, 1) — squeeze to scalar sum
+                pred_sum = y_pred.sum()
+                pred_sum.backward()
+
+                if X_input.grad is not None:
+                    # Extract gradients for test positions only
+                    test_grads = X_input.grad[n_train:, 0, :]  # (n_test, n_TFs)
+                    accumulated_grads += test_grads.detach()
+
+            # IG = (X_test - baseline) × mean(grads)
+            mean_grads = accumulated_grads / n_steps
+            ig_attributions = (X_test - baseline) * mean_grads  # (n_test, n_TFs)
+
+            # Per-TF score: mean(|IG|) across test samples
+            tf_scores = ig_attributions.abs().mean(dim=0)  # (n_TFs,)
+
+            for tf_idx, tf_name in enumerate(self.tf_names):
+                edge_scores[(tf_name, target_name)] = tf_scores[tf_idx].item()
+
+        except Exception as e:
+            import traceback
+            import warnings
+            warnings.warn(
+                f"Integrated Gradients failed for {target_name}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            for tf_name in self.tf_names:
+                edge_scores[(tf_name, target_name)] = 0.0
+        finally:
+            torch.set_grad_enabled(prev_grad)
 
         return edge_scores
 

@@ -797,7 +797,8 @@ class TabPFNWrapper:
             Name of the target gene to get edge scores for
         edge_score_strategy : str, optional
             Edge score strategy to use. If None, uses the strategy from __init__.
-            Options: 'self_attention', 'tf_to_target', 'target_to_tf', 'sequential_rollout'
+            Options: 'self_attention', 'tf_to_target', 'target_to_tf',
+            'sequential_rollout', 'integrated_gradients'
 
         Returns
         -------
@@ -861,7 +862,8 @@ class TabPFNWrapper:
             Target gene names (columns of y during fit)
         edge_score_strategy : str, optional
             Edge score strategy to use. If None, uses the strategy from __init__.
-            Options: 'self_attention', 'tf_to_target', 'target_to_tf', 'sequential_rollout'
+            Options: 'self_attention', 'tf_to_target', 'target_to_tf',
+            'sequential_rollout', 'integrated_gradients'
             This allows computing different edge score strategies without re-fitting.
 
         Returns
