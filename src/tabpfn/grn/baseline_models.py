@@ -533,6 +533,39 @@ class TabPFNWrapper:
         self._X: np.ndarray | None = None
         # Store prepared features for predict
         self._prepared_features: dict[int, tuple[np.ndarray, list[str]]] = {}
+        # Shared model architecture for IG (loaded once, reused across targets)
+        self._shared_model_arch = None
+        self._shared_device = None
+
+    def _ensure_shared_model_arch(self):
+        """Load TabPFN model architecture once for reuse across targets.
+
+        For IG strategy, we only need the pre-trained architecture (identical
+        for all targets). Loading it once avoids redundant ``torch.load()``
+        calls per target.
+        """
+        if self._shared_model_arch is not None:
+            return
+
+        import torch
+        from tabpfn import TabPFNRegressor
+
+        model = TabPFNRegressor(
+            n_estimators=self.n_estimators,
+            device=self.device,
+        )
+        # Fit with small random data to trigger weight loading and device placement
+        rng = np.random.RandomState(0)
+        dummy_X = rng.randn(20, 3).astype(np.float32)
+        dummy_y = rng.randn(20).astype(np.float32)
+        model.fit(dummy_X, dummy_y)
+        self._shared_model_arch = model.models_[0]
+        if hasattr(model, "devices_") and model.devices_:
+            self._shared_device = model.devices_[0]
+        else:
+            self._shared_device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
 
     def fit_one_target_gene(
         self,
@@ -567,6 +600,14 @@ class TabPFNWrapper:
         """
         from tabpfn.grn.grn_regressor import TabPFNGRNRegressor
 
+        # For IG, load model arch once and reuse across all targets
+        shared_model_arch = None
+        shared_device = None
+        if self.edge_score_strategy == "integrated_gradients":
+            self._ensure_shared_model_arch()
+            shared_model_arch = self._shared_model_arch
+            shared_device = self._shared_device
+
         # Create a separate regressor for this single target
         single_target_regressor = TabPFNGRNRegressor(
             tf_names=tf_names_for_target,  # Target excluded from TFs
@@ -581,7 +622,11 @@ class TabPFNWrapper:
         )
 
         # Fit on the target-specific features
-        single_target_regressor.fit(X_for_target, y_target.reshape(-1, 1))
+        single_target_regressor.fit(
+            X_for_target, y_target.reshape(-1, 1),
+            shared_model_arch=shared_model_arch,
+            shared_device=shared_device,
+        )
 
         # Clean up the heavy TabPFN model to free GPU memory
         # We only need the attention weights for edge score computation

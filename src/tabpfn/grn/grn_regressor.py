@@ -183,6 +183,8 @@ class TabPFNGRNRegressor(BaseEstimator):
         self,
         X: npt.NDArray[np.float32],
         y: npt.NDArray[np.float32],
+        shared_model_arch=None,
+        shared_device=None,
     ) -> "TabPFNGRNRegressor":
         """Fit GRN inference model.
 
@@ -196,6 +198,12 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         y : np.ndarray
             Target gene expression matrix of shape (n_samples, n_targets)
+
+        shared_model_arch : torch.nn.Module, optional
+            Pre-loaded TabPFN architecture to reuse (avoids redundant weight
+            loading). Only used for integrated_gradients strategy.
+        shared_device : torch.device, optional
+            Device for the shared model arch.
 
         Returns
         -------
@@ -290,20 +298,41 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         else:
             # Original behavior: fit on all data
-            for target_idx, target_name in enumerate(self.target_genes):
-                # Train model for this target
-                model = TabPFNRegressor(
-                    n_estimators=self.n_estimators,
-                    device=self.device,
-                )
-                model.fit(X, y[:, target_idx])
-                self.target_models_[target_name] = model
+            if self.edge_score_strategy == "integrated_gradients":
+                # IG only needs the pre-trained architecture (same for all
+                # targets) — load it once and compute IG directly.
+                if shared_model_arch is not None:
+                    self._shared_model_arch_ = shared_model_arch
+                    self._shared_device_ = shared_device
+                else:
+                    model = TabPFNRegressor(
+                        n_estimators=self.n_estimators,
+                        device=self.device,
+                    )
+                    # fit on first target just to trigger weight loading
+                    model.fit(X, y[:, 0])
+                    self._log_model_info(model, self.target_genes[0])
+                    self._shared_model_arch_ = model.models_[0]
+                    if hasattr(model, "devices_") and model.devices_:
+                        self._shared_device_ = model.devices_[0]
+                    else:
+                        self._shared_device_ = torch.device(
+                            "cuda" if torch.cuda.is_available() else "cpu"
+                        )
+            else:
+                for target_idx, target_name in enumerate(self.target_genes):
+                    # Train model for this target
+                    model = TabPFNRegressor(
+                        n_estimators=self.n_estimators,
+                        device=self.device,
+                    )
+                    model.fit(X, y[:, target_idx])
+                    self.target_models_[target_name] = model
 
-                # Log pre-trained weight loading information
-                self._log_model_info(model, target_name)
+                    # Log pre-trained weight loading information
+                    self._log_model_info(model, target_name)
 
-                # Extract attention weights (not needed for integrated_gradients)
-                if self.edge_score_strategy != "integrated_gradients":
+                    # Extract attention weights
                     extractor = AttentionExtractor()
                     # Use all layers for rollout strategies; 1 layer otherwise
                     use_all_layers = self.edge_score_strategy in (
@@ -428,32 +457,49 @@ class TabPFNGRNRegressor(BaseEstimator):
         edge_scores = {}
 
         # Integrated gradients doesn't use attention weights —
-        # iterate over target_models_ instead
+        # use shared model architecture loaded once
         if self.edge_score_strategy == "integrated_gradients":
+            # Get shared model arch (loaded once in fit())
+            model_arch = getattr(self, '_shared_model_arch_', None)
+            device = getattr(self, '_shared_device_', None)
+
+            # Fallback: extract from first available target model
+            if model_arch is None:
+                for tn in self.target_genes:
+                    m = self.target_models_.get(tn)
+                    if m is not None and hasattr(m, "models_") and m.models_:
+                        model_arch = m.models_[0]
+                        device = (
+                            m.devices_[0]
+                            if hasattr(m, "devices_") and m.devices_
+                            else torch.device(
+                                "cuda" if torch.cuda.is_available() else "cpu"
+                            )
+                        )
+                        break
+
+            if model_arch is None:
+                for tf_name in self.tf_names:
+                    for target_name in self.target_genes:
+                        edge_scores[(tf_name, target_name)] = 0.0
+                return edge_scores
+
+            if not (hasattr(self, 'X_') and hasattr(self, 'y_')):
+                import warnings
+                warnings.warn("Training data not available for IG.")
+                for tf_name in self.tf_names:
+                    for target_name in self.target_genes:
+                        edge_scores[(tf_name, target_name)] = 0.0
+                return edge_scores
+
+            X_ig = self.X_
             for target_name in self.target_genes:
-                if target_name not in self.target_models_:
-                    for tf_name in self.tf_names:
-                        edge_scores[(tf_name, target_name)] = 0.0
-                    continue
-
-                model = self.target_models_[target_name]
-
-                if hasattr(self, 'X_') and hasattr(self, 'y_'):
-                    X_ig = self.X_
-                    target_idx_in_y = self.target_genes.index(target_name)
-                    y_target = self.y_[:, target_idx_in_y]
-                else:
-                    import warnings
-                    warnings.warn(
-                        f"Training data not available for IG on {target_name}."
-                    )
-                    for tf_name in self.tf_names:
-                        edge_scores[(tf_name, target_name)] = 0.0
-                    continue
+                target_idx_in_y = self.target_genes.index(target_name)
+                y_target = self.y_[:, target_idx_in_y]
 
                 try:
                     target_scores = self._integrated_gradients_edge_scores(
-                        model, X_ig, y_target, target_name,
+                        model_arch, device, X_ig, y_target, target_name,
                         ig_n_folds=self.ig_n_folds,
                         baseline=self.ig_baseline,
                     )
@@ -974,7 +1020,8 @@ class TabPFNGRNRegressor(BaseEstimator):
 
     def _integrated_gradients_edge_scores(
         self,
-        model: TabPFNRegressor,
+        model_arch,
+        device,
         X: np.ndarray,
         y_target: np.ndarray,
         target_name: str,
@@ -991,8 +1038,11 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         Parameters
         ----------
-        model : TabPFNRegressor
-            Fitted TabPFN model for this target gene.
+        model_arch : torch.nn.Module
+            The underlying TabPFN architecture (e.g., PerFeatureTransformer).
+            Shared across all targets — loaded once.
+        device : torch.device
+            Device to run computation on.
         X : np.ndarray
             Input data of shape ``(n_samples, n_TFs)``.
         y_target : np.ndarray
@@ -1018,23 +1068,6 @@ class TabPFNGRNRegressor(BaseEstimator):
         import torch
 
         edge_scores: dict[tuple[str, str], float] = {}
-
-        if not hasattr(model, "models_") or not model.models_:
-            import warnings
-            warnings.warn(
-                f"Model for {target_name} has no underlying architecture "
-                "for Integrated Gradients computation."
-            )
-            for tf_name in self.tf_names:
-                edge_scores[(tf_name, target_name)] = 0.0
-            return edge_scores
-
-        model_arch = model.models_[0]
-
-        if hasattr(model, "devices_") and model.devices_:
-            device = model.devices_[0]
-        else:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         n_samples, n_features = X.shape
 
