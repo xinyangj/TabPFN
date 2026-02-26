@@ -738,6 +738,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--shapley-n-coalitions",
+        type=int,
+        default=500,
+        help="Max sampled coalitions for KernelSHAP (default: 500)"
+    )
+
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -983,6 +990,7 @@ def run_dataset_analysis(
         shapley_n_folds=args.shapley_n_folds,
         shapley_exact_threshold=args.shapley_exact_threshold,
         shapley_method=args.shapley_method,
+        shapley_n_coalitions=args.shapley_n_coalitions,
     )
 
     for strategy, result in tabpfn_results.items():

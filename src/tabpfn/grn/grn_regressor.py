@@ -123,6 +123,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         shapley_n_folds: int = 1,
         shapley_exact_threshold: int = 15,
         shapley_method: str = "auto",
+        shapley_n_coalitions: int = 500,
     ) -> None:
         """Initialize the TabPFNGRNRegressor.
 
@@ -202,6 +203,11 @@ class TabPFNGRNRegressor(BaseEstimator):
             (captures in-context learning signal).
             ``'kernelshap_full'``: KernelSHAP masking both train and test.
             Only used when edge_score_strategy='shapley'.
+        shapley_n_coalitions : int, default=500
+            Maximum number of sampled coalitions for KernelSHAP or large-network
+            permutation Shapley. Only used when n_TFs > shapley_exact_threshold.
+            Literature shows KernelSHAP converges with ~200-500 coalitions.
+            Only used when edge_score_strategy='shapley'.
         """
         self.tf_names = tf_names
         self.target_genes = target_genes
@@ -224,6 +230,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.shapley_n_folds = shapley_n_folds
         self.shapley_exact_threshold = shapley_exact_threshold
         self.shapley_method = shapley_method
+        self.shapley_n_coalitions = shapley_n_coalitions
 
         # Fitted attributes
         self.target_models_: dict[str, TabPFNRegressor] = {}
@@ -1777,7 +1784,19 @@ class TabPFNGRNRegressor(BaseEstimator):
             ))
 
         accumulated_scores = np.zeros(n_features)
-        for X_fold, y_train, y_test, nt in fold_specs:
+        method_label = self.shapley_method if self.shapley_method != "auto" else (
+            "exact" if n_features <= self.shapley_exact_threshold else "permutation"
+        )
+        n_coal_label = (
+            f"2^{n_features}" if n_features <= self.shapley_exact_threshold
+            else str(self.shapley_n_coalitions)
+        )
+        print(
+            f"  Shapley [{method_label}, {n_coal_label} coalitions, "
+            f"{len(fold_specs)} fold(s)] for target {target_name}...",
+            flush=True,
+        )
+        for fold_i, (X_fold, y_train, y_test, nt) in enumerate(fold_specs):
             fold_scores = self._shapley_single_fold(
                 model_arch, device, X_fold, y_train, y_test, nt,
                 criterion=criterion,
@@ -1791,6 +1810,32 @@ class TabPFNGRNRegressor(BaseEstimator):
             edge_scores[(tf_name, target_name)] = float(tf_scores[tf_idx])
 
         return edge_scores
+
+    @staticmethod
+    def _estimate_coalition_batch_size(
+        device, seq_len: int, n_features: int, fallback: int = 10,
+    ) -> int:
+        """Estimate max coalition batch size for TabPFN forward passes.
+
+        Accounts for attention memory scaling as O(batch × seq_len²).
+        """
+        import torch
+
+        if device.type != "cuda":
+            return 500
+
+        try:
+            free_mem = torch.cuda.mem_get_info(device)[0]
+            # Attention memory ≈ seq_len² × n_heads(4) × n_layers(12) × 4 bytes × batch
+            # Plus input/output tensors. Use empirical heuristic:
+            # ~0.5 MB per (seq_len=100, 1 batch item), scales as seq_len²
+            mem_per_item = 0.5 * 1024**2 * (seq_len / 100) ** 2
+            available = free_mem - 1024 * 1024**2  # reserve 1GB
+            max_batch = max(1, int(available / mem_per_item))
+            # Cap to avoid diminishing returns and ensure stability
+            return min(max_batch, 50)
+        except Exception:
+            return fallback
 
     def _shapley_single_fold(
         self,
@@ -1933,16 +1978,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         model_arch.eval()
         all_metrics = torch.zeros(n_coalitions, device=device)
 
-        # Auto-detect max batch
-        if device.type == "cuda":
-            try:
-                free_mem = torch.cuda.mem_get_info(device)[0]
-                max_batch = max(1, int((free_mem - 512 * 1024**2) / (2 * 1024**2)))
-                max_batch = min(max_batch, 500)
-            except Exception:
-                max_batch = 50
-        else:
-            max_batch = n_coalitions
+        max_batch = self._estimate_coalition_batch_size(device, n_samples, n_features)
 
         chunk_size = min(n_coalitions, max_batch)
         c_start = 0
@@ -2007,16 +2043,7 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         model_arch.eval()
 
-        # Auto-detect max batch
-        if device.type == "cuda":
-            try:
-                free_mem = torch.cuda.mem_get_info(device)[0]
-                max_batch = max(1, int((free_mem - 512 * 1024**2) / (2 * 1024**2)))
-                max_batch = min(max_batch, 500)
-            except Exception:
-                max_batch = 50
-        else:
-            max_batch = n_features + 1
+        max_batch = self._estimate_coalition_batch_size(device, n_samples, n_features)
 
         for perm_idx in range(n_perms):
             perm = rng.permutation(n_features)
@@ -2182,15 +2209,15 @@ class TabPFNGRNRegressor(BaseEstimator):
                         if idx & (1 << j):
                             all_masks[idx, j] = 1.0
             else:
-                # Sample coalitions
+                # Sample coalitions — use configurable count
                 rng = np.random.RandomState(self.random_state)
-                n_coalitions = min(2 * n_features + 2048, 2 ** n_features)
+                n_coalitions = min(self.shapley_n_coalitions, 2 ** n_features)
                 masks_np = (rng.rand(n_coalitions, n_features) > 0.5).astype(np.float32)
                 all_masks = torch.from_numpy(masks_np).to(device)
 
             # Evaluate coalitions with train-only NaN masking
             all_metrics = torch.zeros(n_coalitions, device=device)
-            max_batch = 50
+            max_batch = self._estimate_coalition_batch_size(device, n_samples, n_features)
             c_start = 0
             chunk_size = min(n_coalitions, max_batch)
             while c_start < n_coalitions:
@@ -2261,12 +2288,12 @@ class TabPFNGRNRegressor(BaseEstimator):
                             all_masks[idx, j] = 1.0
             else:
                 rng = np.random.RandomState(self.random_state)
-                n_coalitions = min(2 * n_features + 2048, 2 ** n_features)
+                n_coalitions = min(self.shapley_n_coalitions, 2 ** n_features)
                 masks_np = (rng.rand(n_coalitions, n_features) > 0.5).astype(np.float32)
                 all_masks = torch.from_numpy(masks_np).to(device)
 
             all_metrics = torch.zeros(n_coalitions, device=device)
-            max_batch = 50
+            max_batch = self._estimate_coalition_batch_size(device, n_samples, n_features)
             c_start = 0
             chunk_size = min(n_coalitions, max_batch)
             while c_start < n_coalitions:
@@ -2325,15 +2352,18 @@ class TabPFNGRNRegressor(BaseEstimator):
         # Weighted least squares: minimize Σ w_i (v_i - φ_0 - Σ φ_j z_ij)²
         # Add intercept column
         Z_aug = np.column_stack([np.ones(n_coalitions), Z])
-        W = np.diag(weights)
+        # Efficient element-wise weighting (avoids N×N diagonal matrix)
+        sqrt_w = np.sqrt(weights)
+        Z_weighted = Z_aug * sqrt_w[:, None]  # (n_coalitions, n_features+1)
+        v_weighted = v * sqrt_w               # (n_coalitions,)
 
-        # Solve: (Z^T W Z) β = Z^T W v
-        ZtW = Z_aug.T @ W
+        # Solve: (Z_w^T Z_w) β = Z_w^T v_w  (equivalent to W-weighted OLS)
+        ZtZ = Z_weighted.T @ Z_weighted       # (n_features+1, n_features+1)
+        Ztv = Z_weighted.T @ v_weighted       # (n_features+1,)
         try:
-            beta = np.linalg.solve(ZtW @ Z_aug, ZtW @ v)
+            beta = np.linalg.solve(ZtZ, Ztv)
         except np.linalg.LinAlgError:
-            beta = np.linalg.lstsq(Z_aug * np.sqrt(weights)[:, None],
-                                    v * np.sqrt(weights), rcond=None)[0]
+            beta = np.linalg.lstsq(Z_weighted, v_weighted, rcond=None)[0]
 
         # β[0] = intercept (φ_0), β[1:] = Shapley values
         return beta[1:]

@@ -523,6 +523,7 @@ class TabPFNWrapper:
         shapley_n_folds: int = 1,
         shapley_exact_threshold: int = 15,
         shapley_method: str = "auto",
+        shapley_n_coalitions: int = 500,
     ):
         self.n_estimators = n_estimators
         self.attention_aggregation = attention_aggregation
@@ -540,6 +541,7 @@ class TabPFNWrapper:
         self.shapley_n_folds = shapley_n_folds
         self.shapley_exact_threshold = shapley_exact_threshold
         self.shapley_method = shapley_method
+        self.shapley_n_coalitions = shapley_n_coalitions
         # Store individual regressors (one per target gene)
         self._regressors: dict[str, Any] = {}
         # Store fit parameters for prediction
@@ -645,6 +647,7 @@ class TabPFNWrapper:
             shapley_n_folds=self.shapley_n_folds,
             shapley_exact_threshold=self.shapley_exact_threshold,
             shapley_method=self.shapley_method,
+            shapley_n_coalitions=self.shapley_n_coalitions,
         )
 
         # Fit on the target-specific features

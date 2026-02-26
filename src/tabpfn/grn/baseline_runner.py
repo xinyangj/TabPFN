@@ -370,6 +370,7 @@ class GRNBaselineRunner:
         shapley_n_folds: int = 1,
         shapley_exact_threshold: int = 15,
         shapley_method: str = "auto",
+        shapley_n_coalitions: int = 500,
     ) -> dict[str, dict]:
         """Run TabPFN with multiple edge score strategies using per-target processing.
 
@@ -453,6 +454,7 @@ class GRNBaselineRunner:
             shapley_n_folds=shapley_n_folds,
             shapley_exact_threshold=shapley_exact_threshold,
             shapley_method=shapley_method,
+            shapley_n_coalitions=shapley_n_coalitions,
         )
 
         # Initialize edge score dictionaries for each strategy
