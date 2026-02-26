@@ -63,16 +63,46 @@ def rank_average_edge_scores(
     return {e: (max_rank - rank_sum[e] / n_methods) for e in all_edges}
 
 
+def zscore_average_edge_scores(
+    score_dicts: list[dict[tuple[str, str], float]],
+) -> dict[tuple[str, str], float]:
+    """Z-score normalize each method's scores, then average.
+
+    Preserves magnitude information (unlike rank averaging).
+    Each method's scores are standardized to zero-mean, unit-variance
+    before averaging.
+    """
+    all_edges = set()
+    for d in score_dicts:
+        all_edges.update(d.keys())
+    all_edges = sorted(all_edges)
+
+    combined = {e: 0.0 for e in all_edges}
+
+    for d in score_dicts:
+        scores = np.array([d.get(e, 0.0) for e in all_edges])
+        std = scores.std()
+        if std > 0:
+            scores = (scores - scores.mean()) / std
+        else:
+            scores = scores - scores.mean()
+        for i, e in enumerate(all_edges):
+            combined[e] += scores[i]
+
+    n_methods = len(score_dicts)
+    return {e: combined[e] / n_methods for e in all_edges}
+
+
 def run_all_methods_on_network(
     expression, gene_names, tf_names, gold_standard, dataset_name,
-    ig_n_folds=5, ig_baseline="mean",
+    ig_n_folds=5, ig_baseline="mean", rise_n_folds=5,
 ):
-    """Run all 5 methods on one network, return edge scores dict per method."""
+    """Run all methods on one network, return edge scores dict per method."""
     runner = GRNBaselineRunner(normalization="zscore")
     edge_scores = {}
 
-    # TabPFN IG
-    print(f"  Running TabPFN IG (folds={ig_n_folds}, baseline={ig_baseline})...")
+    # TabPFN IG + RISE (run together to share model loading)
+    print(f"  Running TabPFN IG (folds={ig_n_folds}) + RISE (folds={rise_n_folds})...")
     t0 = time.time()
     tabpfn_results = runner.run_tabpfn_multiple_strategies(
         expression=expression,
@@ -81,13 +111,16 @@ def run_all_methods_on_network(
         gold_standard=gold_standard,
         dataset_name=dataset_name,
         n_estimators=1,
-        edge_score_strategies=["integrated_gradients"],
+        edge_score_strategies=["integrated_gradients", "rise"],
         ig_n_folds=ig_n_folds,
         ig_baseline=ig_baseline,
+        rise_n_folds=rise_n_folds,
     )
-    ig_result = tabpfn_results["integrated_gradients"]
-    edge_scores["TabPFN_IG"] = ig_result["edge_scores"]
-    print(f"    TabPFN IG: AUPR={ig_result['metrics']['aupr']:.4f} ({time.time()-t0:.1f}s)")
+    for strategy, result in tabpfn_results.items():
+        label = "TabPFN_IG" if strategy == "integrated_gradients" else "TabPFN_RISE"
+        edge_scores[label] = result["edge_scores"]
+        print(f"    {label}: AUPR={result['metrics']['aupr']:.4f}")
+    print(f"    TabPFN total: {time.time()-t0:.1f}s")
     cleanup_gpu_memory()
 
     # Baselines
@@ -116,7 +149,7 @@ def run_all_methods_on_network(
 
 
 def evaluate_ensembles(edge_scores, gold_standard):
-    """Evaluate individual methods and all IG+baseline ensembles."""
+    """Evaluate individual methods and ensembles using rank avg and z-score avg."""
     results = {}
 
     # Individual methods
@@ -124,33 +157,71 @@ def evaluate_ensembles(edge_scores, gold_standard):
         metrics = evaluate_grn(scores, gold_standard)
         results[name] = {"aupr": metrics["aupr"], "auroc": metrics["auroc"]}
 
-    # Pairwise: IG + each baseline
     baselines = ["GENIE3", "GRNBoost2", "Correlation", "MutualInfo"]
-    for bl in baselines:
-        if bl in edge_scores:
-            ensemble_name = f"IG+{bl}"
-            ensemble_scores = rank_average_edge_scores(
-                [edge_scores["TabPFN_IG"], edge_scores[bl]]
-            )
-            metrics = evaluate_grn(ensemble_scores, gold_standard)
-            results[ensemble_name] = {"aupr": metrics["aupr"], "auroc": metrics["auroc"]}
+    tabpfn_methods = ["TabPFN_IG", "TabPFN_RISE"]
+    fusion_fns = {
+        "rank": rank_average_edge_scores,
+        "zscore": zscore_average_edge_scores,
+    }
 
-    # Full ensemble: IG + all baselines
-    all_dicts = [edge_scores["TabPFN_IG"]]
-    for bl in baselines:
-        if bl in edge_scores:
-            all_dicts.append(edge_scores[bl])
-    if len(all_dicts) > 1:
-        ensemble_scores = rank_average_edge_scores(all_dicts)
-        metrics = evaluate_grn(ensemble_scores, gold_standard)
-        results["IG+All"] = {"aupr": metrics["aupr"], "auroc": metrics["auroc"]}
+    for fusion_name, fusion_fn in fusion_fns.items():
+        suffix = f"[{fusion_name}]"
 
-    # Bonus: baselines-only ensemble (without IG) for comparison
-    baseline_dicts = [edge_scores[bl] for bl in baselines if bl in edge_scores]
-    if len(baseline_dicts) > 1:
-        ensemble_scores = rank_average_edge_scores(baseline_dicts)
-        metrics = evaluate_grn(ensemble_scores, gold_standard)
-        results["Baselines_Only"] = {"aupr": metrics["aupr"], "auroc": metrics["auroc"]}
+        # Pairwise: IG + each baseline
+        for bl in baselines:
+            if "TabPFN_IG" in edge_scores and bl in edge_scores:
+                name = f"IG+{bl} {suffix}"
+                ens = fusion_fn([edge_scores["TabPFN_IG"], edge_scores[bl]])
+                m = evaluate_grn(ens, gold_standard)
+                results[name] = {"aupr": m["aupr"], "auroc": m["auroc"]}
+
+        # IG + RISE (pure TabPFN)
+        if "TabPFN_IG" in edge_scores and "TabPFN_RISE" in edge_scores:
+            name = f"IG+RISE {suffix}"
+            ens = fusion_fn([edge_scores["TabPFN_IG"], edge_scores["TabPFN_RISE"]])
+            m = evaluate_grn(ens, gold_standard)
+            results[name] = {"aupr": m["aupr"], "auroc": m["auroc"]}
+
+        # IG + RISE + GENIE3 (3-way)
+        if all(k in edge_scores for k in ["TabPFN_IG", "TabPFN_RISE", "GENIE3"]):
+            name = f"IG+RISE+GENIE3 {suffix}"
+            ens = fusion_fn([
+                edge_scores["TabPFN_IG"],
+                edge_scores["TabPFN_RISE"],
+                edge_scores["GENIE3"],
+            ])
+            m = evaluate_grn(ens, gold_standard)
+            results[name] = {"aupr": m["aupr"], "auroc": m["auroc"]}
+
+        # IG + all baselines
+        ig_plus_all = [edge_scores["TabPFN_IG"]]
+        for bl in baselines:
+            if bl in edge_scores:
+                ig_plus_all.append(edge_scores[bl])
+        if len(ig_plus_all) > 1:
+            name = f"IG+AllBL {suffix}"
+            ens = fusion_fn(ig_plus_all)
+            m = evaluate_grn(ens, gold_standard)
+            results[name] = {"aupr": m["aupr"], "auroc": m["auroc"]}
+
+        # IG + RISE + all baselines (full 6-method)
+        full = []
+        for k in tabpfn_methods + baselines:
+            if k in edge_scores:
+                full.append(edge_scores[k])
+        if len(full) > 1:
+            name = f"All6 {suffix}"
+            ens = fusion_fn(full)
+            m = evaluate_grn(ens, gold_standard)
+            results[name] = {"aupr": m["aupr"], "auroc": m["auroc"]}
+
+        # Baselines-only ensemble
+        bl_dicts = [edge_scores[bl] for bl in baselines if bl in edge_scores]
+        if len(bl_dicts) > 1:
+            name = f"BaselinesOnly {suffix}"
+            ens = fusion_fn(bl_dicts)
+            m = evaluate_grn(ens, gold_standard)
+            results[name] = {"aupr": m["aupr"], "auroc": m["auroc"]}
 
     return results
 
@@ -221,10 +292,10 @@ def load_dream5_data(dream5_path, max_targets=30):
 
 def print_results_table(results, title):
     """Print a sorted results table."""
-    print(f"\n{'Method':<20} {'AUPR':>8} {'AUROC':>8}")
-    print(f"{'-'*36}")
+    print(f"\n{'Method':<30} {'AUPR':>8} {'AUROC':>8}")
+    print(f"{'-'*46}")
     for method in sorted(results, key=lambda m: results[m]["aupr"], reverse=True):
-        print(f"{method:<20} {results[method]['aupr']:>8.4f} {results[method]['auroc']:>8.4f}")
+        print(f"{method:<30} {results[method]['aupr']:>8.4f} {results[method]['auroc']:>8.4f}")
 
 
 def print_aggregate_table(all_network_results, title):
@@ -257,11 +328,11 @@ def print_aggregate_table(all_network_results, title):
                 "auroc_std": np.std(aurocs),
             }
 
-    print(f"\n{'Method':<20} {'AUPR':>12} {'AUROC':>12}")
-    print(f"{'-'*44}")
+    print(f"\n{'Method':<30} {'AUPR':>12} {'AUROC':>12}")
+    print(f"{'-'*54}")
     for method in sorted(avg_results, key=lambda m: avg_results[m]["aupr"], reverse=True):
         r = avg_results[method]
-        print(f"{method:<20} {r['aupr']:.4f}±{r['aupr_std']:.4f} {r['auroc']:.4f}±{r['auroc_std']:.4f}")
+        print(f"{method:<30} {r['aupr']:.4f}±{r['aupr_std']:.4f} {r['auroc']:.4f}±{r['auroc_std']:.4f}")
 
 
 def run_dream4_10(dream4_path):
@@ -281,7 +352,7 @@ def run_dream4_10(dream4_path):
 
         edge_scores = run_all_methods_on_network(
             expression, gene_names, tf_names, gold_standard, net_name,
-            ig_n_folds=5, ig_baseline="mean",
+            ig_n_folds=5, ig_baseline="mean", rise_n_folds=5,
         )
         results = evaluate_ensembles(edge_scores, gold_standard)
         all_network_results[net_name] = results
@@ -308,6 +379,7 @@ def run_dream5(dream5_path, max_targets=30):
         "DREAM5_Ecoli",
         ig_n_folds=1,  # 1-fold for speed (DREAM5 is large)
         ig_baseline="mean",
+        rise_n_folds=1,
     )
     results = evaluate_ensembles(edge_scores, gold_standard)
     print_results_table(results, "DREAM5 E.coli")
