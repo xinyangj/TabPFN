@@ -366,6 +366,9 @@ class GRNBaselineRunner:
         rise_mask_prob: float = 0.5,
         rise_baseline: str = "zero",
         rise_n_folds: int = 1,
+        shapley_n_permutations: int = 200,
+        shapley_n_folds: int = 1,
+        shapley_exact_threshold: int = 15,
     ) -> dict[str, dict]:
         """Run TabPFN with multiple edge score strategies using per-target processing.
 
@@ -445,6 +448,9 @@ class GRNBaselineRunner:
             rise_mask_prob=rise_mask_prob,
             rise_baseline=rise_baseline,
             rise_n_folds=rise_n_folds,
+            shapley_n_permutations=shapley_n_permutations,
+            shapley_n_folds=shapley_n_folds,
+            shapley_exact_threshold=shapley_exact_threshold,
         )
 
         # Initialize edge score dictionaries for each strategy

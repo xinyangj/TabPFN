@@ -519,6 +519,9 @@ class TabPFNWrapper:
         rise_mask_prob: float = 0.5,
         rise_baseline: str = "zero",
         rise_n_folds: int = 1,
+        shapley_n_permutations: int = 200,
+        shapley_n_folds: int = 1,
+        shapley_exact_threshold: int = 15,
     ):
         self.n_estimators = n_estimators
         self.attention_aggregation = attention_aggregation
@@ -532,6 +535,9 @@ class TabPFNWrapper:
         self.rise_mask_prob = rise_mask_prob
         self.rise_baseline = rise_baseline
         self.rise_n_folds = rise_n_folds
+        self.shapley_n_permutations = shapley_n_permutations
+        self.shapley_n_folds = shapley_n_folds
+        self.shapley_exact_threshold = shapley_exact_threshold
         # Store individual regressors (one per target gene)
         self._regressors: dict[str, Any] = {}
         # Store fit parameters for prediction
@@ -610,10 +616,10 @@ class TabPFNWrapper:
         """
         from tabpfn.grn.grn_regressor import TabPFNGRNRegressor
 
-        # For IG or RISE, load model arch once and reuse across all targets
+        # For IG, RISE, or Shapley, load model arch once and reuse across all targets
         shared_model_arch = None
         shared_device = None
-        if self.edge_score_strategy in ("integrated_gradients", "rise"):
+        if self.edge_score_strategy in ("integrated_gradients", "rise", "shapley"):
             self._ensure_shared_model_arch()
             shared_model_arch = self._shared_model_arch
             shared_device = self._shared_device
@@ -633,6 +639,9 @@ class TabPFNWrapper:
             rise_mask_prob=self.rise_mask_prob,
             rise_baseline=self.rise_baseline,
             rise_n_folds=self.rise_n_folds,
+            shapley_n_permutations=self.shapley_n_permutations,
+            shapley_n_folds=self.shapley_n_folds,
+            shapley_exact_threshold=self.shapley_exact_threshold,
         )
 
         # Fit on the target-specific features

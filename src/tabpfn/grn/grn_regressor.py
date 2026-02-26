@@ -119,6 +119,9 @@ class TabPFNGRNRegressor(BaseEstimator):
         rise_mask_prob: float = 0.5,
         rise_baseline: str = "zero",
         rise_n_folds: int = 1,
+        shapley_n_permutations: int = 200,
+        shapley_n_folds: int = 1,
+        shapley_exact_threshold: int = 15,
     ) -> None:
         """Initialize the TabPFNGRNRegressor.
 
@@ -178,6 +181,18 @@ class TabPFNGRNRegressor(BaseEstimator):
             Number of cross-validation folds for RISE.
             When >1, rotates train/test splits and averages per-TF scores.
             Only used when edge_score_strategy='rise'.
+        shapley_n_permutations : int, default=200
+            Number of random permutations for approximate Shapley values.
+            Only used when n_TFs > shapley_exact_threshold.
+            Only used when edge_score_strategy='shapley'.
+        shapley_n_folds : int, default=1
+            Number of cross-validation folds for Shapley.
+            When >1, rotates train/test splits and averages per-TF scores.
+            Only used when edge_score_strategy='shapley'.
+        shapley_exact_threshold : int, default=15
+            Use exact Shapley (all 2^n coalitions) when n_TFs ≤ this value.
+            Otherwise use permutation-based approximation.
+            Only used when edge_score_strategy='shapley'.
         """
         self.tf_names = tf_names
         self.target_genes = target_genes
@@ -196,6 +211,9 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.rise_mask_prob = rise_mask_prob
         self.rise_baseline = rise_baseline
         self.rise_n_folds = rise_n_folds
+        self.shapley_n_permutations = shapley_n_permutations
+        self.shapley_n_folds = shapley_n_folds
+        self.shapley_exact_threshold = shapley_exact_threshold
 
         # Fitted attributes
         self.target_models_: dict[str, TabPFNRegressor] = {}
@@ -324,8 +342,8 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         else:
             # Original behavior: fit on all data
-            if self.edge_score_strategy in ("integrated_gradients", "rise"):
-                # IG/RISE only need the pre-trained architecture (same for all
+            if self.edge_score_strategy in ("integrated_gradients", "rise", "shapley"):
+                # IG/RISE/Shapley only need the pre-trained architecture (same for all
                 # targets) — load it once and compute directly.
                 if shared_model_arch is not None:
                     self._shared_model_arch_ = shared_model_arch
@@ -597,7 +615,54 @@ class TabPFNGRNRegressor(BaseEstimator):
 
             return edge_scores
 
-        computer = EdgeScoreComputer(aggregation_method=self.attention_aggregation)
+        # Shapley — NaN-masking based feature attribution
+        if self.edge_score_strategy == "shapley":
+            model_arch = getattr(self, '_shared_model_arch_', None)
+            device = getattr(self, '_shared_device_', None)
+
+            if model_arch is None:
+                for tn in self.target_genes:
+                    m = self.target_models_.get(tn)
+                    if m is not None and hasattr(m, "models_") and m.models_:
+                        model_arch = m.models_[0]
+                        device = (
+                            m.devices_[0]
+                            if hasattr(m, "devices_") and m.devices_
+                            else torch.device(
+                                "cuda" if torch.cuda.is_available() else "cpu"
+                            )
+                        )
+                        break
+
+            if model_arch is None or not (hasattr(self, 'X_') and hasattr(self, 'y_')):
+                for tf_name in self.tf_names:
+                    for target_name in self.target_genes:
+                        edge_scores[(tf_name, target_name)] = 0.0
+                return edge_scores
+
+            X_shap = self.X_
+            criterion = getattr(self, '_shared_criterion_', None)
+            for target_name in self.target_genes:
+                target_idx_in_y = self.target_genes.index(target_name)
+                y_target = self.y_[:, target_idx_in_y]
+
+                try:
+                    target_scores = self._shapley_edge_scores(
+                        model_arch, device, X_shap, y_target, target_name,
+                        criterion=criterion,
+                    )
+                    edge_scores.update(target_scores)
+                except Exception as e:
+                    import warnings
+                    import traceback
+                    warnings.warn(
+                        f"Failed Shapley for {target_name}: {e}\n"
+                        f"{traceback.format_exc()}"
+                    )
+                    for tf_name in self.tf_names:
+                        edge_scores[(tf_name, target_name)] = 0.0
+
+            return edge_scores
 
         for target_name, attention in self.attention_weights_.items():
             # Handle sequential_rollout strategy
@@ -1620,6 +1685,361 @@ class TabPFNGRNRegressor(BaseEstimator):
         rise_scores = (present_avg - absent_avg).abs()
 
         return rise_scores.cpu().numpy()
+
+    # ------------------------------------------------------------------
+    # Shapley value edge scores (NaN-masking)
+    # ------------------------------------------------------------------
+
+    def _shapley_edge_scores(
+        self,
+        model_arch,
+        device,
+        X: np.ndarray,
+        y_target: np.ndarray,
+        target_name: str,
+        n_train: int | None = None,
+        criterion=None,
+    ) -> dict[tuple[str, str], float]:
+        """Compute edge scores using Shapley values with optional CV.
+
+        Uses NaN-masking to simulate feature removal, leveraging TabPFN's
+        built-in NaN handling (NanHandlingEncoderStep) so the model sees
+        features as genuinely absent rather than zeroed.
+
+        For n_TFs ≤ shapley_exact_threshold: exact Shapley (all 2^n coalitions).
+        Otherwise: permutation-based approximation.
+
+        Parameters
+        ----------
+        model_arch : torch.nn.Module
+            Pre-loaded TabPFN architecture.
+        device : torch.device
+            Computation device.
+        X : np.ndarray
+            TF expression matrix (n_samples, n_features).
+        y_target : np.ndarray
+            Target gene expression (n_samples,).
+        target_name : str
+            Name of target gene.
+        n_train : int, optional
+            Number of training samples for single-fold.
+        criterion : FullSupportBarDistribution, optional
+            Bar distribution for converting logits to mean predictions.
+
+        Returns
+        -------
+        dict of (str, str) → float
+            Edge scores for (TF, target) pairs.
+        """
+        import torch
+
+        n_samples, n_features = X.shape
+        n_folds = self.shapley_n_folds
+
+        # Build fold specs (same pattern as IG/RISE)
+        fold_specs: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
+
+        if n_folds > 1:
+            from sklearn.model_selection import KFold
+            kfold = KFold(
+                n_splits=n_folds, shuffle=True,
+                random_state=self.random_state,
+            )
+            for train_idx, test_idx in kfold.split(X):
+                X_fold = np.concatenate([X[train_idx], X[test_idx]], axis=0)
+                y_train = y_target[train_idx]
+                y_test = y_target[test_idx]
+                fold_specs.append((X_fold, y_train, y_test, len(train_idx)))
+        else:
+            if n_train is None:
+                n_train = max(1, int(n_samples * 0.8))
+            if n_samples - n_train < 1:
+                import warnings
+                warnings.warn(
+                    f"Not enough samples for Shapley split (n={n_samples})."
+                )
+                edge_scores = {}
+                for tf_name in self.tf_names:
+                    edge_scores[(tf_name, target_name)] = 0.0
+                return edge_scores
+            fold_specs.append((
+                X, y_target[:n_train], y_target[n_train:], n_train
+            ))
+
+        accumulated_scores = np.zeros(n_features)
+        for X_fold, y_train, y_test, nt in fold_specs:
+            fold_scores = self._shapley_single_fold(
+                model_arch, device, X_fold, y_train, y_test, nt,
+                criterion=criterion,
+            )
+            accumulated_scores += fold_scores
+
+        tf_scores = accumulated_scores / len(fold_specs)
+
+        edge_scores: dict[tuple[str, str], float] = {}
+        for tf_idx, tf_name in enumerate(self.tf_names):
+            edge_scores[(tf_name, target_name)] = float(tf_scores[tf_idx])
+
+        return edge_scores
+
+    def _shapley_single_fold(
+        self,
+        model_arch,
+        device,
+        X: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        n_train: int,
+        criterion=None,
+    ) -> np.ndarray:
+        """Compute Shapley values for a single train/test split.
+
+        Returns
+        -------
+        scores : np.ndarray
+            Shape ``(n_features,)`` — per-TF Shapley importance scores.
+        """
+        import torch
+        from itertools import combinations as itertools_combinations
+
+        n_samples, n_features = X.shape
+        use_exact = n_features <= self.shapley_exact_threshold
+
+        if use_exact:
+            return self._shapley_exact(
+                model_arch, device, X, y_train, y_test, n_train,
+                criterion=criterion,
+            )
+        else:
+            return self._shapley_permutation(
+                model_arch, device, X, y_train, y_test, n_train,
+                criterion=criterion,
+            )
+
+    def _shapley_eval_coalition(
+        self,
+        model_arch,
+        device,
+        X_t: "torch.Tensor",
+        y_train_t: "torch.Tensor",
+        y_test_t: "torch.Tensor",
+        n_train: int,
+        coalition_masks: "torch.Tensor",
+        criterion=None,
+    ) -> "torch.Tensor":
+        """Evaluate prediction quality for a batch of coalitions.
+
+        Parameters
+        ----------
+        X_t : Tensor (n_samples, n_features)
+        y_train_t : Tensor (n_train,)
+        y_test_t : Tensor (n_test,)
+        coalition_masks : Tensor (n_coalitions, n_features)
+            Binary: 1 = feature present, 0 = feature NaN-masked.
+
+        Returns
+        -------
+        metrics : Tensor (n_coalitions,)
+            Negative MSE per coalition (higher = better).
+        """
+        import torch
+
+        n_samples, n_features = X_t.shape
+        n_test = n_samples - n_train
+        n_coalitions = coalition_masks.shape[0]
+
+        # Expand X and apply NaN masking
+        # X_expanded: (n_samples, n_coalitions, n_features)
+        X_expanded = X_t.unsqueeze(1).expand(n_samples, n_coalitions, n_features).clone()
+        # Where mask is 0, set to NaN
+        nan_mask = (coalition_masks == 0).unsqueeze(0).expand(
+            n_samples, n_coalitions, n_features
+        )
+        X_expanded[nan_mask] = float('nan')
+
+        y_input = y_train_t.unsqueeze(1).unsqueeze(2).expand(n_train, n_coalitions, 1)
+
+        with torch.no_grad():
+            output = model_arch.forward(
+                x={"main": X_expanded},
+                y={"main": y_input},
+                only_return_standard_out=True,
+            )
+
+        if isinstance(output, dict):
+            y_pred = output.get("standard", next(iter(output.values())))
+        elif isinstance(output, (list, tuple)):
+            y_pred = output[0]
+        else:
+            y_pred = output
+
+        if y_pred is None or y_pred.numel() == 0:
+            return torch.zeros(n_coalitions, device=device)
+
+        # Convert logits to mean predictions
+        if criterion is not None:
+            mean_preds = criterion.mean(y_pred)  # (n_test, n_coalitions)
+        else:
+            mean_preds = y_pred.mean(dim=-1)
+
+        # Negative MSE per coalition
+        y_test_expanded = y_test_t.unsqueeze(1).expand(n_test, n_coalitions)
+        metrics = -((mean_preds - y_test_expanded) ** 2).mean(dim=0)  # (n_coalitions,)
+        return metrics
+
+    def _shapley_exact(
+        self,
+        model_arch,
+        device,
+        X: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        n_train: int,
+        criterion=None,
+    ) -> np.ndarray:
+        """Exact Shapley values by enumerating all 2^n coalitions."""
+        import torch
+        from itertools import combinations as itertools_combinations
+
+        n_samples, n_features = X.shape
+        n_coalitions = 2 ** n_features
+
+        X_t = torch.from_numpy(X).float().to(device)
+        y_train_t = torch.from_numpy(y_train).float().to(device)
+        y_test_t = torch.from_numpy(y_test).float().to(device)
+
+        # Build all coalition masks: (2^n, n_features)
+        all_masks = torch.zeros(n_coalitions, n_features, device=device)
+        for idx in range(n_coalitions):
+            for j in range(n_features):
+                if idx & (1 << j):
+                    all_masks[idx, j] = 1.0
+
+        # Evaluate all coalitions in chunks
+        model_arch.eval()
+        all_metrics = torch.zeros(n_coalitions, device=device)
+
+        # Auto-detect max batch
+        if device.type == "cuda":
+            try:
+                free_mem = torch.cuda.mem_get_info(device)[0]
+                max_batch = max(1, int((free_mem - 512 * 1024**2) / (2 * 1024**2)))
+                max_batch = min(max_batch, 500)
+            except Exception:
+                max_batch = 50
+        else:
+            max_batch = n_coalitions
+
+        chunk_size = min(n_coalitions, max_batch)
+        c_start = 0
+        while c_start < n_coalitions:
+            c_end = min(c_start + chunk_size, n_coalitions)
+            try:
+                chunk_metrics = self._shapley_eval_coalition(
+                    model_arch, device, X_t, y_train_t, y_test_t,
+                    n_train, all_masks[c_start:c_end], criterion,
+                )
+                all_metrics[c_start:c_end] = chunk_metrics
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                chunk_size = max(1, chunk_size // 2)
+                continue
+            c_start = c_end
+
+        # Compute exact Shapley values from coalition metrics
+        # φ_j = Σ_{S ⊆ N\{j}} [|S|!(n-|S|-1)!/n!] [v(S∪{j}) - v(S)]
+        import math
+        shapley_values = torch.zeros(n_features, device=device)
+        n = n_features
+        factorial_n = math.factorial(n)
+
+        for j in range(n_features):
+            for idx in range(n_coalitions):
+                # Check if j is NOT in coalition idx
+                if idx & (1 << j):
+                    continue
+                # S = coalition idx (without j)
+                s_size = bin(idx).count('1')
+                # v(S ∪ {j}) - v(S)
+                idx_with_j = idx | (1 << j)
+                marginal = all_metrics[idx_with_j] - all_metrics[idx]
+                weight = math.factorial(s_size) * math.factorial(n - s_size - 1) / factorial_n
+                shapley_values[j] += weight * marginal
+
+        return shapley_values.abs().cpu().numpy()
+
+    def _shapley_permutation(
+        self,
+        model_arch,
+        device,
+        X: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        n_train: int,
+        criterion=None,
+    ) -> np.ndarray:
+        """Approximate Shapley values via permutation sampling."""
+        import torch
+
+        n_samples, n_features = X.shape
+        n_perms = self.shapley_n_permutations
+
+        X_t = torch.from_numpy(X).float().to(device)
+        y_train_t = torch.from_numpy(y_train).float().to(device)
+        y_test_t = torch.from_numpy(y_test).float().to(device)
+
+        rng = np.random.RandomState(self.random_state)
+        shapley_values = torch.zeros(n_features, device=device)
+
+        model_arch.eval()
+
+        # Auto-detect max batch
+        if device.type == "cuda":
+            try:
+                free_mem = torch.cuda.mem_get_info(device)[0]
+                max_batch = max(1, int((free_mem - 512 * 1024**2) / (2 * 1024**2)))
+                max_batch = min(max_batch, 500)
+            except Exception:
+                max_batch = 50
+        else:
+            max_batch = n_features + 1
+
+        for perm_idx in range(n_perms):
+            perm = rng.permutation(n_features)
+
+            # Build n+1 coalition masks for this permutation:
+            # empty → {perm[0]} → {perm[0],perm[1]} → ... → all features
+            masks = torch.zeros(n_features + 1, n_features, device=device)
+            for k in range(n_features):
+                masks[k + 1] = masks[k].clone()
+                masks[k + 1, perm[k]] = 1.0
+
+            # Evaluate all n+1 coalitions
+            chunk_size = min(n_features + 1, max_batch)
+            all_metrics = torch.zeros(n_features + 1, device=device)
+            c_start = 0
+            while c_start < n_features + 1:
+                c_end = min(c_start + chunk_size, n_features + 1)
+                try:
+                    chunk_metrics = self._shapley_eval_coalition(
+                        model_arch, device, X_t, y_train_t, y_test_t,
+                        n_train, masks[c_start:c_end], criterion,
+                    )
+                    all_metrics[c_start:c_end] = chunk_metrics
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    chunk_size = max(1, chunk_size // 2)
+                    continue
+                c_start = c_end
+
+            # Marginal contribution of each feature in this permutation
+            for k in range(n_features):
+                feature_j = perm[k]
+                marginal = all_metrics[k + 1] - all_metrics[k]
+                shapley_values[feature_j] += marginal
+
+        shapley_values /= n_perms
+        return shapley_values.abs().cpu().numpy()
 
     def cleanup_model(self, target_name: str | None = None) -> None:
         """Delete the fitted TabPFN model to free GPU memory.

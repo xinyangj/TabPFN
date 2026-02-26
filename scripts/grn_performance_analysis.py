@@ -652,7 +652,7 @@ Examples:
         nargs="+",
         choices=["self_attention", "tf_to_target", "target_to_tf", "combined",
                  "combined_best", "sequential_rollout", "gradient_rollout",
-                 "integrated_gradients", "rise"],
+                 "integrated_gradients", "rise", "shapley"],
         default=None,
         help="TabPFN edge score strategies to test (default: all 9 strategies)"
     )
@@ -706,6 +706,27 @@ Examples:
         type=int,
         default=1,
         help="Number of CV folds for RISE (default: 1, no CV)"
+    )
+
+    parser.add_argument(
+        "--shapley-n-permutations",
+        type=int,
+        default=200,
+        help="Number of permutations for approximate Shapley (default: 200)"
+    )
+
+    parser.add_argument(
+        "--shapley-n-folds",
+        type=int,
+        default=1,
+        help="Number of CV folds for Shapley (default: 1, no CV)"
+    )
+
+    parser.add_argument(
+        "--shapley-exact-threshold",
+        type=int,
+        default=15,
+        help="Use exact Shapley when n_TFs <= this value (default: 15)"
     )
 
     parser.add_argument(
@@ -950,6 +971,9 @@ def run_dataset_analysis(
         rise_mask_prob=args.rise_mask_prob,
         rise_baseline=args.rise_baseline,
         rise_n_folds=args.rise_n_folds,
+        shapley_n_permutations=args.shapley_n_permutations,
+        shapley_n_folds=args.shapley_n_folds,
+        shapley_exact_threshold=args.shapley_exact_threshold,
     )
 
     for strategy, result in tabpfn_results.items():
