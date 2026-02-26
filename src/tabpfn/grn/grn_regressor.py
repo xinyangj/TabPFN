@@ -122,6 +122,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         shapley_n_permutations: int = 200,
         shapley_n_folds: int = 1,
         shapley_exact_threshold: int = 15,
+        shapley_method: str = "auto",
     ) -> None:
         """Initialize the TabPFNGRNRegressor.
 
@@ -193,6 +194,14 @@ class TabPFNGRNRegressor(BaseEstimator):
             Use exact Shapley (all 2^n coalitions) when n_TFs ≤ this value.
             Otherwise use permutation-based approximation.
             Only used when edge_score_strategy='shapley'.
+        shapley_method : str, default='auto'
+            Shapley computation method. Options:
+            ``'auto'``: exact (≤threshold TFs) or permutation (>threshold).
+            ``'kernelshap_test'``: KernelSHAP masking test features only.
+            ``'kernelshap_train'``: KernelSHAP masking train features only
+            (captures in-context learning signal).
+            ``'kernelshap_full'``: KernelSHAP masking both train and test.
+            Only used when edge_score_strategy='shapley'.
         """
         self.tf_names = tf_names
         self.target_genes = target_genes
@@ -214,6 +223,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.shapley_n_permutations = shapley_n_permutations
         self.shapley_n_folds = shapley_n_folds
         self.shapley_exact_threshold = shapley_exact_threshold
+        self.shapley_method = shapley_method
 
         # Fitted attributes
         self.target_models_: dict[str, TabPFNRegressor] = {}
@@ -1799,13 +1809,17 @@ class TabPFNGRNRegressor(BaseEstimator):
         scores : np.ndarray
             Shape ``(n_features,)`` — per-TF Shapley importance scores.
         """
-        import torch
-        from itertools import combinations as itertools_combinations
-
         n_samples, n_features = X.shape
-        use_exact = n_features <= self.shapley_exact_threshold
+        method = self.shapley_method
 
-        if use_exact:
+        if method.startswith("kernelshap"):
+            return self._shapley_kernelshap(
+                model_arch, device, X, y_train, y_test, n_train,
+                criterion=criterion, mode=method,
+            )
+
+        # "auto": exact if small, permutation otherwise
+        if n_features <= self.shapley_exact_threshold:
             return self._shapley_exact(
                 model_arch, device, X, y_train, y_test, n_train,
                 criterion=criterion,
@@ -2040,6 +2054,289 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         shapley_values /= n_perms
         return shapley_values.abs().cpu().numpy()
+
+    def _shapley_kernelshap(
+        self,
+        model_arch,
+        device,
+        X: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        n_train: int,
+        criterion=None,
+        mode: str = "kernelshap_full",
+    ) -> np.ndarray:
+        """Compute Shapley values using the shap.KernelExplainer package.
+
+        Three modes adapted for TabPFN's in-context learning:
+
+        - ``kernelshap_test``: Mask features in test samples only.
+          Measures direct feature effect on predictions.
+        - ``kernelshap_train``: Mask features in train samples only.
+          Measures in-context learning contribution of each TF.
+        - ``kernelshap_full``: Mask features in both train and test.
+          Measures total TF contribution (learning + prediction).
+
+        Returns
+        -------
+        scores : np.ndarray
+            Shape ``(n_features,)`` — per-TF importance (mean |SHAP|).
+        """
+        import shap
+        import torch
+
+        n_samples, n_features = X.shape
+        n_test = n_samples - n_train
+
+        X_train_np = X[:n_train]
+        X_test_np = X[n_train:]
+
+        X_t = torch.from_numpy(X).float().to(device)
+        y_train_t = torch.from_numpy(y_train).float().to(device)
+
+        model_arch.eval()
+
+        def _forward_predict(X_input_np):
+            """Run TabPFN forward and return mean predictions for test samples."""
+            X_in = torch.from_numpy(X_input_np.astype(np.float32)).to(device)
+            seq_len = X_in.shape[0]
+            batch = 1
+            X_3d = X_in.unsqueeze(1)  # (seq_len, 1, n_features)
+            y_in = y_train_t.unsqueeze(1).unsqueeze(2)  # (n_train, 1, 1)
+
+            with torch.no_grad():
+                output = model_arch.forward(
+                    x={"main": X_3d},
+                    y={"main": y_in},
+                    only_return_standard_out=True,
+                )
+
+            if isinstance(output, dict):
+                y_pred = output.get("standard", next(iter(output.values())))
+            elif isinstance(output, (list, tuple)):
+                y_pred = output[0]
+            else:
+                y_pred = output
+
+            if y_pred is None or y_pred.numel() == 0:
+                return np.zeros(seq_len - n_train)
+
+            if criterion is not None:
+                preds = criterion.mean(y_pred).squeeze(-1)  # (n_test,) or (n_test, 1)
+            else:
+                preds = y_pred.mean(dim=-1).squeeze(-1)
+
+            return preds.cpu().numpy().flatten()
+
+        if mode == "kernelshap_test":
+            # Mask test features only; train data is fixed
+            def predict_fn(X_test_masked):
+                """X_test_masked: (n_samples_shap, n_features)."""
+                results = []
+                for i in range(X_test_masked.shape[0]):
+                    X_combined = np.vstack([X_train_np, X_test_masked[i:i+1]])
+                    preds = _forward_predict(X_combined)
+                    results.append(preds[0] if preds.size > 0 else 0.0)
+                return np.array(results)
+
+            background = shap.sample(X_train_np, min(50, n_train))
+            explainer = shap.KernelExplainer(predict_fn, background)
+            shap_values = explainer.shap_values(X_test_np, nsamples=128, silent=True)
+            # shap_values: (n_test, n_features)
+            return np.mean(np.abs(shap_values), axis=0)
+
+        elif mode == "kernelshap_train":
+            # Mask train features only; test data is fixed
+            # For each test sample, compute SHAP over training features
+            all_shap = np.zeros(n_features)
+
+            def make_train_predict(x_test_row):
+                def predict_fn(X_train_masked):
+                    results = []
+                    for i in range(X_train_masked.shape[0]):
+                        X_combined = np.vstack([X_train_masked[i:i+1].repeat(n_train, axis=0), x_test_row.reshape(1, -1)])
+                        # Need to reconstruct: masked train (n_train rows) + fixed test (1 row)
+                        # X_train_masked[i] is one background-substituted version of a single train row
+                        # But KernelSHAP gives us full masked train sets? No — it masks features.
+                        # We need: for each mask, apply it to ALL train rows
+                        X_tr_masked = X_train_np.copy()
+                        # Replace masked features with the background values
+                        mask = ~np.isnan(X_train_masked[i]) if np.any(np.isnan(X_train_masked[i])) else np.ones(n_features, dtype=bool)
+                        X_combined_full = np.vstack([X_tr_masked, x_test_row.reshape(1, -1)])
+                        preds = _forward_predict(X_combined_full)
+                        results.append(preds[0] if preds.size > 0 else 0.0)
+                    return np.array(results)
+                return predict_fn
+
+            # Train-only is complex with KernelExplainer's API.
+            # Simpler approach: use _shapley_eval_coalition with train-only NaN-masking
+            X_t_full = torch.from_numpy(X).float().to(device)
+            y_test_t = torch.from_numpy(y_test).float().to(device)
+
+            # Use exact or sampled coalitions, but only NaN-mask training rows
+            if n_features <= self.shapley_exact_threshold:
+                n_coalitions = 2 ** n_features
+                all_masks = torch.zeros(n_coalitions, n_features, device=device)
+                for idx in range(n_coalitions):
+                    for j in range(n_features):
+                        if idx & (1 << j):
+                            all_masks[idx, j] = 1.0
+            else:
+                # Sample coalitions
+                rng = np.random.RandomState(self.random_state)
+                n_coalitions = min(2 * n_features + 2048, 2 ** n_features)
+                masks_np = (rng.rand(n_coalitions, n_features) > 0.5).astype(np.float32)
+                all_masks = torch.from_numpy(masks_np).to(device)
+
+            # Evaluate coalitions with train-only NaN masking
+            all_metrics = torch.zeros(n_coalitions, device=device)
+            max_batch = 50
+            c_start = 0
+            chunk_size = min(n_coalitions, max_batch)
+            while c_start < n_coalitions:
+                c_end = min(c_start + chunk_size, n_coalitions)
+                chunk_masks = all_masks[c_start:c_end]
+                chunk_n = c_end - c_start
+
+                # NaN-mask only train rows; keep test rows intact
+                X_expanded = X_t_full.unsqueeze(1).expand(
+                    n_samples, chunk_n, n_features
+                ).clone()
+                nan_mask_train = (chunk_masks == 0).unsqueeze(0).expand(
+                    n_train, chunk_n, n_features
+                )
+                X_expanded[:n_train][nan_mask_train] = float('nan')
+                # Test rows remain unmasked
+
+                y_input = y_train_t.unsqueeze(1).unsqueeze(2).expand(n_train, chunk_n, 1)
+
+                try:
+                    with torch.no_grad():
+                        output = model_arch.forward(
+                            x={"main": X_expanded},
+                            y={"main": y_input},
+                            only_return_standard_out=True,
+                        )
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    chunk_size = max(1, chunk_size // 2)
+                    continue
+
+                if isinstance(output, dict):
+                    y_pred = output.get("standard", next(iter(output.values())))
+                elif isinstance(output, (list, tuple)):
+                    y_pred = output[0]
+                else:
+                    y_pred = output
+
+                if y_pred is not None and y_pred.numel() > 0:
+                    if criterion is not None:
+                        mean_preds = criterion.mean(y_pred)
+                    else:
+                        mean_preds = y_pred.mean(dim=-1)
+                    y_test_exp = y_test_t.unsqueeze(1).expand(n_test, chunk_n)
+                    metrics = -((mean_preds - y_test_exp) ** 2).mean(dim=0)
+                    all_metrics[c_start:c_end] = metrics
+
+                c_start = c_end
+
+            # Solve weighted linear regression for Shapley values
+            Z = all_masks.cpu().numpy()  # (n_coalitions, n_features)
+            v = all_metrics.cpu().numpy()  # (n_coalitions,)
+            shap_values = self._solve_kernelshap_wls(Z, v, n_features)
+            return np.abs(shap_values)
+
+        else:  # kernelshap_full
+            # Mask features in both train and test (same as current NaN-masking)
+            # Reuse _shapley_eval_coalition with all coalitions
+            X_t_full = torch.from_numpy(X).float().to(device)
+            y_test_t = torch.from_numpy(y_test).float().to(device)
+
+            if n_features <= self.shapley_exact_threshold:
+                n_coalitions = 2 ** n_features
+                all_masks = torch.zeros(n_coalitions, n_features, device=device)
+                for idx in range(n_coalitions):
+                    for j in range(n_features):
+                        if idx & (1 << j):
+                            all_masks[idx, j] = 1.0
+            else:
+                rng = np.random.RandomState(self.random_state)
+                n_coalitions = min(2 * n_features + 2048, 2 ** n_features)
+                masks_np = (rng.rand(n_coalitions, n_features) > 0.5).astype(np.float32)
+                all_masks = torch.from_numpy(masks_np).to(device)
+
+            all_metrics = torch.zeros(n_coalitions, device=device)
+            max_batch = 50
+            c_start = 0
+            chunk_size = min(n_coalitions, max_batch)
+            while c_start < n_coalitions:
+                c_end = min(c_start + chunk_size, n_coalitions)
+                try:
+                    chunk_metrics = self._shapley_eval_coalition(
+                        model_arch, device, X_t_full, y_train_t, y_test_t,
+                        n_train, all_masks[c_start:c_end], criterion,
+                    )
+                    all_metrics[c_start:c_end] = chunk_metrics
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    chunk_size = max(1, chunk_size // 2)
+                    continue
+                c_start = c_end
+
+            Z = all_masks.cpu().numpy()
+            v = all_metrics.cpu().numpy()
+            shap_values = self._solve_kernelshap_wls(Z, v, n_features)
+            return np.abs(shap_values)
+
+    @staticmethod
+    def _solve_kernelshap_wls(
+        Z: np.ndarray, v: np.ndarray, n_features: int,
+    ) -> np.ndarray:
+        """Solve KernelSHAP weighted least squares.
+
+        Parameters
+        ----------
+        Z : np.ndarray (n_coalitions, n_features)
+            Binary coalition masks.
+        v : np.ndarray (n_coalitions,)
+            Value function for each coalition.
+        n_features : int
+            Number of features.
+
+        Returns
+        -------
+        shap_values : np.ndarray (n_features,)
+        """
+        from scipy.special import comb
+
+        n = n_features
+        n_coalitions = Z.shape[0]
+
+        # Compute SHAP kernel weights
+        weights = np.zeros(n_coalitions)
+        for i in range(n_coalitions):
+            s = int(Z[i].sum())
+            if s == 0 or s == n:
+                weights[i] = 1e6  # Large weight for empty/full coalitions
+            else:
+                denom = comb(n, s, exact=True) * s * (n - s)
+                weights[i] = (n - 1) / denom if denom > 0 else 1e6
+
+        # Weighted least squares: minimize Σ w_i (v_i - φ_0 - Σ φ_j z_ij)²
+        # Add intercept column
+        Z_aug = np.column_stack([np.ones(n_coalitions), Z])
+        W = np.diag(weights)
+
+        # Solve: (Z^T W Z) β = Z^T W v
+        ZtW = Z_aug.T @ W
+        try:
+            beta = np.linalg.solve(ZtW @ Z_aug, ZtW @ v)
+        except np.linalg.LinAlgError:
+            beta = np.linalg.lstsq(Z_aug * np.sqrt(weights)[:, None],
+                                    v * np.sqrt(weights), rcond=None)[0]
+
+        # β[0] = intercept (φ_0), β[1:] = Shapley values
+        return beta[1:]
 
     def cleanup_model(self, target_name: str | None = None) -> None:
         """Delete the fitted TabPFN model to free GPU memory.

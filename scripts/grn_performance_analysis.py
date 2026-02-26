@@ -730,6 +730,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--shapley-method",
+        type=str,
+        default="auto",
+        choices=["auto", "kernelshap_test", "kernelshap_train", "kernelshap_full"],
+        help="Shapley computation method (default: auto = exact/permutation)"
+    )
+
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -974,6 +982,7 @@ def run_dataset_analysis(
         shapley_n_permutations=args.shapley_n_permutations,
         shapley_n_folds=args.shapley_n_folds,
         shapley_exact_threshold=args.shapley_exact_threshold,
+        shapley_method=args.shapley_method,
     )
 
     for strategy, result in tabpfn_results.items():
