@@ -362,6 +362,9 @@ class GRNBaselineRunner:
         edge_score_strategies: list[str] | None = None,
         ig_n_folds: int = 1,
         ig_baseline: str = "zero",
+        rise_n_masks: int = 500,
+        rise_mask_prob: float = 0.5,
+        rise_baseline: str = "zero",
     ) -> dict[str, dict]:
         """Run TabPFN with multiple edge score strategies using per-target processing.
 
@@ -412,7 +415,7 @@ class GRNBaselineRunner:
             edge_score_strategies = [
                 'self_attention', 'tf_to_target', 'target_to_tf',
                 'combined', 'combined_best', 'sequential_rollout',
-                'gradient_rollout', 'integrated_gradients'
+                'gradient_rollout', 'integrated_gradients', 'rise'
             ]
 
         # 1. Prepare data using unified pipeline
@@ -437,6 +440,9 @@ class GRNBaselineRunner:
             keep_model=True,  # Keep model for edge score extraction, cleanup manually
             ig_n_folds=ig_n_folds,
             ig_baseline=ig_baseline,
+            rise_n_masks=rise_n_masks,
+            rise_mask_prob=rise_mask_prob,
+            rise_baseline=rise_baseline,
         )
 
         # Initialize edge score dictionaries for each strategy

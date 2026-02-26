@@ -652,9 +652,9 @@ Examples:
         nargs="+",
         choices=["self_attention", "tf_to_target", "target_to_tf", "combined",
                  "combined_best", "sequential_rollout", "gradient_rollout",
-                 "integrated_gradients"],
+                 "integrated_gradients", "rise"],
         default=None,
-        help="TabPFN edge score strategies to test (default: all 8 strategies)"
+        help="TabPFN edge score strategies to test (default: all 9 strategies)"
     )
 
     parser.add_argument(
@@ -677,6 +677,28 @@ Examples:
         default="zero",
         choices=["zero", "mean"],
         help="Baseline for Integrated Gradients (default: zero)"
+    )
+
+    parser.add_argument(
+        "--rise-n-masks",
+        type=int,
+        default=500,
+        help="Number of random masks for RISE (default: 500)"
+    )
+
+    parser.add_argument(
+        "--rise-mask-prob",
+        type=float,
+        default=0.5,
+        help="Probability of keeping each feature in RISE masks (default: 0.5)"
+    )
+
+    parser.add_argument(
+        "--rise-baseline",
+        type=str,
+        default="zero",
+        choices=["zero", "mean"],
+        help="Baseline fill for masked features in RISE (default: zero)"
     )
 
     parser.add_argument(
@@ -917,6 +939,9 @@ def run_dataset_analysis(
         edge_score_strategies=tabpfn_strategies,
         ig_n_folds=args.ig_n_folds,
         ig_baseline=args.ig_baseline,
+        rise_n_masks=args.rise_n_masks,
+        rise_mask_prob=args.rise_mask_prob,
+        rise_baseline=args.rise_baseline,
     )
 
     for strategy, result in tabpfn_results.items():
@@ -1042,6 +1067,7 @@ def main() -> None:
             "sequential_rollout",
             "gradient_rollout",
             "integrated_gradients",
+            "rise",
         ]
 
     # Print configuration

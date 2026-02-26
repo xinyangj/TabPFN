@@ -70,6 +70,9 @@ class TabPFNGRNRegressor(BaseEstimator):
         - 'integrated_gradients': Use Integrated Gradients (Sundararajan et al., 2017) to
           compute feature attributions via gradient interpolation from a zero baseline.
           Captures causal feature importance rather than attention routing patterns.
+        - 'rise': Use RISE (Randomized Input Sampling for Explanation) to compute
+          feature attributions via random binary masking. Forward-only (no gradients),
+          avoids gradient coupling through TabPFN's grouped-feature architecture.
 
     device : str, default='auto'
         Device to use for computation ('auto', 'cpu', 'cuda')
@@ -112,6 +115,9 @@ class TabPFNGRNRegressor(BaseEstimator):
         use_kronecker: bool = True,
         ig_n_folds: int = 1,
         ig_baseline: str = "zero",
+        rise_n_masks: int = 500,
+        rise_mask_prob: float = 0.5,
+        rise_baseline: str = "zero",
     ) -> None:
         """Initialize the TabPFNGRNRegressor.
 
@@ -157,6 +163,16 @@ class TabPFNGRNRegressor(BaseEstimator):
             ``'zero'``: all-zero vector (no TF expression).
             ``'mean'``: per-feature mean of training samples in each fold.
             Only used when edge_score_strategy='integrated_gradients'.
+        rise_n_masks : int, default=500
+            Number of random binary masks for RISE.
+            Only used when edge_score_strategy='rise'.
+        rise_mask_prob : float, default=0.5
+            Probability of keeping each feature in RISE masks.
+            Only used when edge_score_strategy='rise'.
+        rise_baseline : str, default='zero'
+            Fill value for masked-out features in RISE.
+            ``'zero'``: fill with zeros. ``'mean'``: fill with training mean.
+            Only used when edge_score_strategy='rise'.
         """
         self.tf_names = tf_names
         self.target_genes = target_genes
@@ -171,6 +187,9 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.use_kronecker = use_kronecker
         self.ig_n_folds = ig_n_folds
         self.ig_baseline = ig_baseline
+        self.rise_n_masks = rise_n_masks
+        self.rise_mask_prob = rise_mask_prob
+        self.rise_baseline = rise_baseline
 
         # Fitted attributes
         self.target_models_: dict[str, TabPFNRegressor] = {}
@@ -185,6 +204,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         y: npt.NDArray[np.float32],
         shared_model_arch=None,
         shared_device=None,
+        shared_criterion=None,
     ) -> "TabPFNGRNRegressor":
         """Fit GRN inference model.
 
@@ -201,7 +221,7 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         shared_model_arch : torch.nn.Module, optional
             Pre-loaded TabPFN architecture to reuse (avoids redundant weight
-            loading). Only used for integrated_gradients strategy.
+            loading). Used for integrated_gradients and rise strategies.
         shared_device : torch.device, optional
             Device for the shared model arch.
 
@@ -298,12 +318,13 @@ class TabPFNGRNRegressor(BaseEstimator):
 
         else:
             # Original behavior: fit on all data
-            if self.edge_score_strategy == "integrated_gradients":
-                # IG only needs the pre-trained architecture (same for all
-                # targets) — load it once and compute IG directly.
+            if self.edge_score_strategy in ("integrated_gradients", "rise"):
+                # IG/RISE only need the pre-trained architecture (same for all
+                # targets) — load it once and compute directly.
                 if shared_model_arch is not None:
                     self._shared_model_arch_ = shared_model_arch
                     self._shared_device_ = shared_device
+                    self._shared_criterion_ = shared_criterion
                 else:
                     model = TabPFNRegressor(
                         n_estimators=self.n_estimators,
@@ -313,6 +334,7 @@ class TabPFNGRNRegressor(BaseEstimator):
                     model.fit(X, y[:, 0])
                     self._log_model_info(model, self.target_genes[0])
                     self._shared_model_arch_ = model.models_[0]
+                    self._shared_criterion_ = model.znorm_space_bardist_
                     if hasattr(model, "devices_") and model.devices_:
                         self._shared_device_ = model.devices_[0]
                     else:
@@ -509,6 +531,58 @@ class TabPFNGRNRegressor(BaseEstimator):
                     import traceback
                     warnings.warn(
                         f"Failed integrated_gradients for {target_name}: {e}\n"
+                        f"{traceback.format_exc()}"
+                    )
+                    for tf_name in self.tf_names:
+                        edge_scores[(tf_name, target_name)] = 0.0
+
+            return edge_scores
+
+        # RISE — forward-only perturbation method
+        if self.edge_score_strategy == "rise":
+            model_arch = getattr(self, '_shared_model_arch_', None)
+            device = getattr(self, '_shared_device_', None)
+
+            if model_arch is None:
+                for tn in self.target_genes:
+                    m = self.target_models_.get(tn)
+                    if m is not None and hasattr(m, "models_") and m.models_:
+                        model_arch = m.models_[0]
+                        device = (
+                            m.devices_[0]
+                            if hasattr(m, "devices_") and m.devices_
+                            else torch.device(
+                                "cuda" if torch.cuda.is_available() else "cpu"
+                            )
+                        )
+                        break
+
+            if model_arch is None or not (hasattr(self, 'X_') and hasattr(self, 'y_')):
+                for tf_name in self.tf_names:
+                    for target_name in self.target_genes:
+                        edge_scores[(tf_name, target_name)] = 0.0
+                return edge_scores
+
+            X_rise = self.X_
+            criterion = getattr(self, '_shared_criterion_', None)
+            for target_name in self.target_genes:
+                target_idx_in_y = self.target_genes.index(target_name)
+                y_target = self.y_[:, target_idx_in_y]
+
+                try:
+                    target_scores = self._rise_edge_scores(
+                        model_arch, device, X_rise, y_target, target_name,
+                        n_masks=self.rise_n_masks,
+                        mask_prob=self.rise_mask_prob,
+                        baseline=self.rise_baseline,
+                        criterion=criterion,
+                    )
+                    edge_scores.update(target_scores)
+                except Exception as e:
+                    import warnings
+                    import traceback
+                    warnings.warn(
+                        f"Failed RISE for {target_name}: {e}\n"
                         f"{traceback.format_exc()}"
                     )
                     for tf_name in self.tf_names:
@@ -1314,6 +1388,183 @@ class TabPFNGRNRegressor(BaseEstimator):
             torch.set_grad_enabled(prev_grad)
 
         return fold_scores
+
+    # ------------------------------------------------------------------
+    # RISE (Randomized Input Sampling for Explanation)
+    # ------------------------------------------------------------------
+
+    def _rise_edge_scores(
+        self,
+        model_arch,
+        device,
+        X: np.ndarray,
+        y_target: np.ndarray,
+        target_name: str,
+        n_train: int | None = None,
+        n_masks: int = 500,
+        mask_prob: float = 0.5,
+        baseline: str = "zero",
+        criterion=None,
+    ) -> dict[tuple[str, str], float]:
+        """Compute edge scores using RISE (forward-only, no gradients).
+
+        Generates random binary masks over input features, runs forward
+        passes with masked inputs, and attributes each TF based on the
+        correlation between its presence and prediction quality.
+
+        Parameters
+        ----------
+        model_arch : torch.nn.Module
+            The underlying TabPFN architecture.
+        device : torch.device
+            Device for computation.
+        X : np.ndarray
+            Input data of shape ``(n_samples, n_TFs)``.
+        y_target : np.ndarray
+            Target gene expression of shape ``(n_samples,)``.
+        target_name : str
+            Name of the target gene.
+        n_train : int, optional
+            Number of training samples. If ``None``, uses 80%.
+        n_masks : int, default=500
+            Number of random binary masks.
+        mask_prob : float, default=0.5
+            Probability of keeping each feature per mask.
+        baseline : str, default="zero"
+            Fill value for masked features: ``"zero"`` or ``"mean"``.
+        criterion : FullSupportBarDistribution, optional
+            Bar distribution for converting logits to mean predictions.
+            If None, uses logit sum as prediction proxy.
+
+        Returns
+        -------
+        edge_scores : dict
+            ``{(tf_name, target_name): score}`` for every TF.
+        """
+        import torch
+
+        edge_scores: dict[tuple[str, str], float] = {}
+        n_samples, n_features = X.shape
+
+        if n_train is None:
+            n_train = max(1, int(n_samples * 0.8))
+        if n_samples - n_train < 1:
+            import warnings
+            warnings.warn(f"Not enough samples for RISE split (n={n_samples}).")
+            for tf_name in self.tf_names:
+                edge_scores[(tf_name, target_name)] = 0.0
+            return edge_scores
+
+        X_t = torch.from_numpy(X).float().to(device)
+        y_train_t = torch.from_numpy(y_target[:n_train]).float().to(device)
+        y_test_t = torch.from_numpy(y_target[n_train:]).float().to(device)
+        seq_len = n_samples
+        n_test = n_samples - n_train
+
+        # Compute baseline fill values
+        if baseline == "mean":
+            fill_values = X_t[:n_train].mean(dim=0)  # (n_features,)
+        else:
+            fill_values = torch.zeros(n_features, device=device)
+
+        # Generate random binary masks: (n_masks, n_features)
+        rng = np.random.RandomState(self.random_state)
+        masks_np = (rng.rand(n_masks, n_features) < mask_prob).astype(np.float32)
+        masks = torch.from_numpy(masks_np).to(device)  # (n_masks, n_features)
+
+        # Auto-detect max batch size (forward-only uses ~3× less memory than fwd+bwd)
+        if device.type == "cuda":
+            try:
+                free_mem = torch.cuda.mem_get_info(device)[0]
+                max_batch = max(1, int((free_mem - 512 * 1024**2) / (2 * 1024**2)))
+                max_batch = min(max_batch, 500)
+            except Exception:
+                max_batch = 50
+        else:
+            max_batch = n_masks
+
+        model_arch.eval()
+        # Accumulate weighted scores: sum(pred_metric * mask_j) per TF
+        weighted_sum = torch.zeros(n_features, device=device)
+        mask_count = torch.zeros(n_features, device=device)
+        total_metric_sum = torch.zeros(n_features, device=device)
+
+        m_start = 0
+        chunk_size = min(n_masks, max_batch)
+        while m_start < n_masks:
+            m_end = min(m_start + chunk_size, n_masks)
+            chunk_n = m_end - m_start
+            chunk_masks = masks[m_start:m_end]  # (chunk_n, n_features)
+
+            # Apply masks: X_masked = X * mask + fill * (1 - mask)
+            # X_t: (seq_len, n_features), chunk_masks: (chunk_n, n_features)
+            X_expanded = X_t.unsqueeze(1).expand(seq_len, chunk_n, n_features)
+            mask_expanded = chunk_masks.unsqueeze(0).expand(seq_len, chunk_n, n_features)
+            fill_expanded = fill_values.unsqueeze(0).unsqueeze(0).expand(
+                seq_len, chunk_n, n_features
+            )
+            X_masked = X_expanded * mask_expanded + fill_expanded * (1 - mask_expanded)
+
+            # y_input: (n_train, chunk_n, 1)
+            y_input = y_train_t.unsqueeze(1).unsqueeze(2).expand(n_train, chunk_n, 1)
+
+            try:
+                with torch.no_grad():
+                    output = model_arch.forward(
+                        x={"main": X_masked},
+                        y={"main": y_input},
+                        only_return_standard_out=True,
+                    )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                chunk_size = max(1, chunk_size // 2)
+                continue
+
+            # Extract predictions
+            if isinstance(output, dict):
+                y_pred = output.get("standard", next(iter(output.values())))
+            elif isinstance(output, (list, tuple)):
+                y_pred = output[0]
+            else:
+                y_pred = output
+
+            if y_pred is None or y_pred.numel() == 0:
+                m_start = m_end
+                continue
+
+            # Prediction metric per mask: negative MSE (higher = better)
+            # y_pred shape: (n_test, chunk_n, n_out) where n_out may be 5000 bars
+            if criterion is not None:
+                mean_preds = criterion.mean(y_pred)  # (n_test, chunk_n)
+            else:
+                mean_preds = y_pred.mean(dim=-1)  # (n_test, chunk_n)
+            # Negative MSE per mask: -mean((pred - actual)^2) over test samples
+            y_test_expanded = y_test_t.unsqueeze(1).expand(n_test, chunk_n)
+            pred_metric = -((mean_preds - y_test_expanded) ** 2).mean(dim=0)  # (chunk_n,)
+
+            # Accumulate: weighted_sum[j] += sum(pred_metric * mask[j])
+            weighted_sum += (pred_metric.unsqueeze(1) * chunk_masks).sum(dim=0)
+            mask_count += chunk_masks.sum(dim=0)
+            # Also track total metric for absent computation
+            total_metric_sum += pred_metric.sum().expand(n_features)
+
+            m_start = m_end
+
+        # RISE score: average metric when TF_j is present - when absent
+        mask_count = mask_count.clamp(min=1)
+        absent_count = (n_masks - mask_count).clamp(min=1)
+        present_avg = weighted_sum / mask_count
+        absent_sum = total_metric_sum - weighted_sum
+        absent_avg = absent_sum / absent_count
+        # Importance = how much better predictions are when TF_j is present
+        rise_scores = (present_avg - absent_avg).abs()
+
+        tf_scores = rise_scores.cpu().numpy()
+
+        for tf_idx, tf_name in enumerate(self.tf_names):
+            edge_scores[(tf_name, target_name)] = float(tf_scores[tf_idx])
+
+        return edge_scores
 
     def cleanup_model(self, target_name: str | None = None) -> None:
         """Delete the fitted TabPFN model to free GPU memory.

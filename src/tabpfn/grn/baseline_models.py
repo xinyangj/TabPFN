@@ -515,6 +515,9 @@ class TabPFNWrapper:
         keep_model: bool = False,
         ig_n_folds: int = 1,
         ig_baseline: str = "zero",
+        rise_n_masks: int = 500,
+        rise_mask_prob: float = 0.5,
+        rise_baseline: str = "zero",
     ):
         self.n_estimators = n_estimators
         self.attention_aggregation = attention_aggregation
@@ -524,6 +527,9 @@ class TabPFNWrapper:
         self.keep_model = keep_model
         self.ig_n_folds = ig_n_folds
         self.ig_baseline = ig_baseline
+        self.rise_n_masks = rise_n_masks
+        self.rise_mask_prob = rise_mask_prob
+        self.rise_baseline = rise_baseline
         # Store individual regressors (one per target gene)
         self._regressors: dict[str, Any] = {}
         # Store fit parameters for prediction
@@ -533,9 +539,10 @@ class TabPFNWrapper:
         self._X: np.ndarray | None = None
         # Store prepared features for predict
         self._prepared_features: dict[int, tuple[np.ndarray, list[str]]] = {}
-        # Shared model architecture for IG (loaded once, reused across targets)
+        # Shared model architecture for IG/RISE (loaded once, reused across targets)
         self._shared_model_arch = None
         self._shared_device = None
+        self._shared_criterion = None
 
     def _ensure_shared_model_arch(self):
         """Load TabPFN model architecture once for reuse across targets.
@@ -560,6 +567,7 @@ class TabPFNWrapper:
         dummy_y = rng.randn(20).astype(np.float32)
         model.fit(dummy_X, dummy_y)
         self._shared_model_arch = model.models_[0]
+        self._shared_criterion = model.znorm_space_bardist_
         if hasattr(model, "devices_") and model.devices_:
             self._shared_device = model.devices_[0]
         else:
@@ -600,10 +608,10 @@ class TabPFNWrapper:
         """
         from tabpfn.grn.grn_regressor import TabPFNGRNRegressor
 
-        # For IG, load model arch once and reuse across all targets
+        # For IG or RISE, load model arch once and reuse across all targets
         shared_model_arch = None
         shared_device = None
-        if self.edge_score_strategy == "integrated_gradients":
+        if self.edge_score_strategy in ("integrated_gradients", "rise"):
             self._ensure_shared_model_arch()
             shared_model_arch = self._shared_model_arch
             shared_device = self._shared_device
@@ -619,6 +627,9 @@ class TabPFNWrapper:
             random_state=self.random_state,
             ig_n_folds=self.ig_n_folds,
             ig_baseline=self.ig_baseline,
+            rise_n_masks=self.rise_n_masks,
+            rise_mask_prob=self.rise_mask_prob,
+            rise_baseline=self.rise_baseline,
         )
 
         # Fit on the target-specific features
@@ -626,6 +637,7 @@ class TabPFNWrapper:
             X_for_target, y_target.reshape(-1, 1),
             shared_model_arch=shared_model_arch,
             shared_device=shared_device,
+            shared_criterion=self._shared_criterion,
         )
 
         # Clean up the heavy TabPFN model to free GPU memory
