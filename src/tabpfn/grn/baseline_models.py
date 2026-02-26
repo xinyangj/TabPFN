@@ -518,6 +518,7 @@ class TabPFNWrapper:
         rise_n_masks: int = 500,
         rise_mask_prob: float = 0.5,
         rise_baseline: str = "zero",
+        rise_n_folds: int = 1,
     ):
         self.n_estimators = n_estimators
         self.attention_aggregation = attention_aggregation
@@ -530,6 +531,7 @@ class TabPFNWrapper:
         self.rise_n_masks = rise_n_masks
         self.rise_mask_prob = rise_mask_prob
         self.rise_baseline = rise_baseline
+        self.rise_n_folds = rise_n_folds
         # Store individual regressors (one per target gene)
         self._regressors: dict[str, Any] = {}
         # Store fit parameters for prediction
@@ -630,6 +632,7 @@ class TabPFNWrapper:
             rise_n_masks=self.rise_n_masks,
             rise_mask_prob=self.rise_mask_prob,
             rise_baseline=self.rise_baseline,
+            rise_n_folds=self.rise_n_folds,
         )
 
         # Fit on the target-specific features

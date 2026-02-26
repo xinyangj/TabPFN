@@ -702,6 +702,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--rise-n-folds",
+        type=int,
+        default=1,
+        help="Number of CV folds for RISE (default: 1, no CV)"
+    )
+
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -942,6 +949,7 @@ def run_dataset_analysis(
         rise_n_masks=args.rise_n_masks,
         rise_mask_prob=args.rise_mask_prob,
         rise_baseline=args.rise_baseline,
+        rise_n_folds=args.rise_n_folds,
     )
 
     for strategy, result in tabpfn_results.items():

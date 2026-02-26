@@ -365,6 +365,7 @@ class GRNBaselineRunner:
         rise_n_masks: int = 500,
         rise_mask_prob: float = 0.5,
         rise_baseline: str = "zero",
+        rise_n_folds: int = 1,
     ) -> dict[str, dict]:
         """Run TabPFN with multiple edge score strategies using per-target processing.
 
@@ -443,6 +444,7 @@ class GRNBaselineRunner:
             rise_n_masks=rise_n_masks,
             rise_mask_prob=rise_mask_prob,
             rise_baseline=rise_baseline,
+            rise_n_folds=rise_n_folds,
         )
 
         # Initialize edge score dictionaries for each strategy

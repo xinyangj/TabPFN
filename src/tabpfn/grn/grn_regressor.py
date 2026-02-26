@@ -118,6 +118,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         rise_n_masks: int = 500,
         rise_mask_prob: float = 0.5,
         rise_baseline: str = "zero",
+        rise_n_folds: int = 1,
     ) -> None:
         """Initialize the TabPFNGRNRegressor.
 
@@ -173,6 +174,10 @@ class TabPFNGRNRegressor(BaseEstimator):
             Fill value for masked-out features in RISE.
             ``'zero'``: fill with zeros. ``'mean'``: fill with training mean.
             Only used when edge_score_strategy='rise'.
+        rise_n_folds : int, default=1
+            Number of cross-validation folds for RISE.
+            When >1, rotates train/test splits and averages per-TF scores.
+            Only used when edge_score_strategy='rise'.
         """
         self.tf_names = tf_names
         self.target_genes = target_genes
@@ -190,6 +195,7 @@ class TabPFNGRNRegressor(BaseEstimator):
         self.rise_n_masks = rise_n_masks
         self.rise_mask_prob = rise_mask_prob
         self.rise_baseline = rise_baseline
+        self.rise_n_folds = rise_n_folds
 
         # Fitted attributes
         self.target_models_: dict[str, TabPFNRegressor] = {}
@@ -576,6 +582,7 @@ class TabPFNGRNRegressor(BaseEstimator):
                         mask_prob=self.rise_mask_prob,
                         baseline=self.rise_baseline,
                         criterion=criterion,
+                        rise_n_folds=self.rise_n_folds,
                     )
                     edge_scores.update(target_scores)
                 except Exception as e:
@@ -1405,12 +1412,13 @@ class TabPFNGRNRegressor(BaseEstimator):
         mask_prob: float = 0.5,
         baseline: str = "zero",
         criterion=None,
+        rise_n_folds: int = 1,
     ) -> dict[tuple[str, str], float]:
-        """Compute edge scores using RISE (forward-only, no gradients).
+        """Compute edge scores using RISE with optional cross-validation.
 
         Generates random binary masks over input features, runs forward
         passes with masked inputs, and attributes each TF based on the
-        correlation between its presence and prediction quality.
+        correlation between its presence and prediction accuracy.
 
         Parameters
         ----------
@@ -1434,7 +1442,9 @@ class TabPFNGRNRegressor(BaseEstimator):
             Fill value for masked features: ``"zero"`` or ``"mean"``.
         criterion : FullSupportBarDistribution, optional
             Bar distribution for converting logits to mean predictions.
-            If None, uses logit sum as prediction proxy.
+        rise_n_folds : int, default=1
+            Number of CV folds. When >1, rotates train/test splits and
+            averages per-TF scores across folds.
 
         Returns
         -------
@@ -1443,36 +1453,95 @@ class TabPFNGRNRegressor(BaseEstimator):
         """
         import torch
 
-        edge_scores: dict[tuple[str, str], float] = {}
         n_samples, n_features = X.shape
 
-        if n_train is None:
-            n_train = max(1, int(n_samples * 0.8))
-        if n_samples - n_train < 1:
-            import warnings
-            warnings.warn(f"Not enough samples for RISE split (n={n_samples}).")
-            for tf_name in self.tf_names:
-                edge_scores[(tf_name, target_name)] = 0.0
-            return edge_scores
+        # Build fold specifications (same pattern as IG)
+        fold_specs: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
+
+        if rise_n_folds > 1:
+            from sklearn.model_selection import KFold
+            kfold = KFold(
+                n_splits=rise_n_folds, shuffle=True,
+                random_state=self.random_state,
+            )
+            for train_idx, test_idx in kfold.split(X):
+                X_fold = np.concatenate([X[train_idx], X[test_idx]], axis=0)
+                y_train = y_target[train_idx]
+                y_test = y_target[test_idx]
+                fold_specs.append((X_fold, y_train, y_test, len(train_idx)))
+        else:
+            if n_train is None:
+                n_train = max(1, int(n_samples * 0.8))
+            if n_samples - n_train < 1:
+                import warnings
+                warnings.warn(f"Not enough samples for RISE split (n={n_samples}).")
+                edge_scores = {}
+                for tf_name in self.tf_names:
+                    edge_scores[(tf_name, target_name)] = 0.0
+                return edge_scores
+            fold_specs.append((
+                X, y_target[:n_train], y_target[n_train:], n_train
+            ))
+
+        # Run RISE on each fold, accumulate scores
+        accumulated_scores = np.zeros(n_features)
+        for X_fold, y_train, y_test, nt in fold_specs:
+            fold_scores = self._rise_single_fold(
+                model_arch, device, X_fold, y_train, y_test, nt,
+                n_masks=n_masks, mask_prob=mask_prob,
+                baseline=baseline, criterion=criterion,
+            )
+            accumulated_scores += fold_scores
+
+        tf_scores = accumulated_scores / len(fold_specs)
+
+        edge_scores: dict[tuple[str, str], float] = {}
+        for tf_idx, tf_name in enumerate(self.tf_names):
+            edge_scores[(tf_name, target_name)] = float(tf_scores[tf_idx])
+
+        return edge_scores
+
+    def _rise_single_fold(
+        self,
+        model_arch,
+        device,
+        X: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        n_train: int,
+        n_masks: int,
+        mask_prob: float,
+        baseline: str,
+        criterion=None,
+    ) -> np.ndarray:
+        """Run RISE for a single train/test split.
+
+        Returns
+        -------
+        scores : np.ndarray
+            Shape ``(n_features,)`` — per-TF RISE importance scores.
+        """
+        import torch
+
+        n_samples, n_features = X.shape
+        n_test = n_samples - n_train
 
         X_t = torch.from_numpy(X).float().to(device)
-        y_train_t = torch.from_numpy(y_target[:n_train]).float().to(device)
-        y_test_t = torch.from_numpy(y_target[n_train:]).float().to(device)
-        seq_len = n_samples
-        n_test = n_samples - n_train
+        y_train_t = torch.from_numpy(y_train).float().to(device)
+        y_test_t = torch.from_numpy(y_test).float().to(device)
 
         # Compute baseline fill values
         if baseline == "mean":
-            fill_values = X_t[:n_train].mean(dim=0)  # (n_features,)
+            fill_values = X_t[:n_train].mean(dim=0)
         else:
             fill_values = torch.zeros(n_features, device=device)
 
-        # Generate random binary masks: (n_masks, n_features)
+        # Generate random binary masks
         rng = np.random.RandomState(self.random_state)
         masks_np = (rng.rand(n_masks, n_features) < mask_prob).astype(np.float32)
-        masks = torch.from_numpy(masks_np).to(device)  # (n_masks, n_features)
+        masks = torch.from_numpy(masks_np).to(device)
 
-        # Auto-detect max batch size (forward-only uses ~3× less memory than fwd+bwd)
+        # Auto-detect max batch size
         if device.type == "cuda":
             try:
                 free_mem = torch.cuda.mem_get_info(device)[0]
@@ -1484,7 +1553,6 @@ class TabPFNGRNRegressor(BaseEstimator):
             max_batch = n_masks
 
         model_arch.eval()
-        # Accumulate weighted scores: sum(pred_metric * mask_j) per TF
         weighted_sum = torch.zeros(n_features, device=device)
         mask_count = torch.zeros(n_features, device=device)
         total_metric_sum = torch.zeros(n_features, device=device)
@@ -1494,18 +1562,15 @@ class TabPFNGRNRegressor(BaseEstimator):
         while m_start < n_masks:
             m_end = min(m_start + chunk_size, n_masks)
             chunk_n = m_end - m_start
-            chunk_masks = masks[m_start:m_end]  # (chunk_n, n_features)
+            chunk_masks = masks[m_start:m_end]
 
-            # Apply masks: X_masked = X * mask + fill * (1 - mask)
-            # X_t: (seq_len, n_features), chunk_masks: (chunk_n, n_features)
-            X_expanded = X_t.unsqueeze(1).expand(seq_len, chunk_n, n_features)
-            mask_expanded = chunk_masks.unsqueeze(0).expand(seq_len, chunk_n, n_features)
+            X_expanded = X_t.unsqueeze(1).expand(n_samples, chunk_n, n_features)
+            mask_expanded = chunk_masks.unsqueeze(0).expand(n_samples, chunk_n, n_features)
             fill_expanded = fill_values.unsqueeze(0).unsqueeze(0).expand(
-                seq_len, chunk_n, n_features
+                n_samples, chunk_n, n_features
             )
             X_masked = X_expanded * mask_expanded + fill_expanded * (1 - mask_expanded)
 
-            # y_input: (n_train, chunk_n, 1)
             y_input = y_train_t.unsqueeze(1).unsqueeze(2).expand(n_train, chunk_n, 1)
 
             try:
@@ -1520,7 +1585,6 @@ class TabPFNGRNRegressor(BaseEstimator):
                 chunk_size = max(1, chunk_size // 2)
                 continue
 
-            # Extract predictions
             if isinstance(output, dict):
                 y_pred = output.get("standard", next(iter(output.values())))
             elif isinstance(output, (list, tuple)):
@@ -1532,39 +1596,30 @@ class TabPFNGRNRegressor(BaseEstimator):
                 m_start = m_end
                 continue
 
-            # Prediction metric per mask: negative MSE (higher = better)
-            # y_pred shape: (n_test, chunk_n, n_out) where n_out may be 5000 bars
+            # Convert logits to mean predictions
             if criterion is not None:
                 mean_preds = criterion.mean(y_pred)  # (n_test, chunk_n)
             else:
-                mean_preds = y_pred.mean(dim=-1)  # (n_test, chunk_n)
-            # Negative MSE per mask: -mean((pred - actual)^2) over test samples
+                mean_preds = y_pred.mean(dim=-1)
+            # Negative MSE per mask
             y_test_expanded = y_test_t.unsqueeze(1).expand(n_test, chunk_n)
-            pred_metric = -((mean_preds - y_test_expanded) ** 2).mean(dim=0)  # (chunk_n,)
+            pred_metric = -((mean_preds - y_test_expanded) ** 2).mean(dim=0)
 
-            # Accumulate: weighted_sum[j] += sum(pred_metric * mask[j])
             weighted_sum += (pred_metric.unsqueeze(1) * chunk_masks).sum(dim=0)
             mask_count += chunk_masks.sum(dim=0)
-            # Also track total metric for absent computation
             total_metric_sum += pred_metric.sum().expand(n_features)
 
             m_start = m_end
 
-        # RISE score: average metric when TF_j is present - when absent
+        # RISE score: avg metric when present - avg metric when absent
         mask_count = mask_count.clamp(min=1)
         absent_count = (n_masks - mask_count).clamp(min=1)
         present_avg = weighted_sum / mask_count
         absent_sum = total_metric_sum - weighted_sum
         absent_avg = absent_sum / absent_count
-        # Importance = how much better predictions are when TF_j is present
         rise_scores = (present_avg - absent_avg).abs()
 
-        tf_scores = rise_scores.cpu().numpy()
-
-        for tf_idx, tf_name in enumerate(self.tf_names):
-            edge_scores[(tf_name, target_name)] = float(tf_scores[tf_idx])
-
-        return edge_scores
+        return rise_scores.cpu().numpy()
 
     def cleanup_model(self, target_name: str | None = None) -> None:
         """Delete the fitted TabPFN model to free GPU memory.
