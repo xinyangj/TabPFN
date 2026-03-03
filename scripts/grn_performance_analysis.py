@@ -115,30 +115,38 @@ def evaluate_tabpfn_expression_prediction(
     """
     import gc
     from tabpfn.grn.evaluation import compute_expression_metrics
+    from tabpfn.grn.baseline_models import prepare_target_features
 
     # Set the necessary attributes that predict_one_target_gene() needs
     model._tf_names = tf_names
     model._target_genes = target_genes
+
+    # Prepare features with proper target exclusion (prevents data leakage
+    # when a target gene is also a TF, e.g., DREAM4-10 where all genes are TFs)
+    prepared_train = prepare_target_features(
+        X=X_train, y=y_train, tf_names=tf_names, target_genes=target_genes
+    )
 
     # Initialize predictions array
     y_pred = np.zeros_like(y_test)
 
     # Fit, predict, and cleanup each target one at a time in a single loop
     for target_idx, target_name in enumerate(target_genes):
+        X_train_for_target, tf_names_for_target = prepared_train[target_idx]
         y_target = y_train[:, target_idx]
         model.fit_one_target_gene(
             target_idx=target_idx,
             target_name=target_name,
-            X_for_target=X_train,
+            X_for_target=X_train_for_target,
             y_target=y_target,
-            tf_names_for_target=tf_names,
+            tf_names_for_target=tf_names_for_target,
         )
 
-        # Predict for this target
+        # Predict for this target (using matching feature subset)
         prediction_result = model.predict_one_target_gene(
             target_name=target_name,
             X=X_test,
-            tf_names_for_target=tf_names,
+            tf_names_for_target=tf_names_for_target,
             cleanup_after=True,  # Cleanup after prediction
         )
 
