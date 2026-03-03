@@ -681,6 +681,9 @@ class TabPFNGRNRegressor(BaseEstimator):
 
             return edge_scores
 
+        # Create EdgeScoreComputer for attention-based strategies
+        computer = EdgeScoreComputer(aggregation_method="mean")
+
         for target_name, attention in self.attention_weights_.items():
             # Handle sequential_rollout strategy
             if self.edge_score_strategy == "sequential_rollout":
