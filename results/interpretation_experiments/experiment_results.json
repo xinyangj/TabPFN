@@ -1,0 +1,212 @@
+{
+  "data_stats": {
+    "n_datasets": 193,
+    "feature_dim": 1155,
+    "n_features_mean": 14.709844559585493,
+    "n_features_range": [
+      5,
+      25
+    ],
+    "n_direct_parents_mean": 2.906735751295337,
+    "n_ancestors_mean": 5.217616580310881,
+    "parent_fraction_mean": 0.19938234115596393,
+    "ancestor_fraction_mean": 0.3449017178468088
+  },
+  "results": {
+    "binary_direct": {
+      "baselines": {
+        "random": {
+          "auroc": 0.5381091318591319,
+          "aupr": 0.2755179310308273,
+          "accuracy": 0.5226781857451404,
+          "precision": 0.2764227642276423,
+          "recall": 0.6126126126126126,
+          "f1": 0.380952380952381
+        },
+        "constant_mean": {
+          "auroc": 0.5,
+          "aupr": 0.23974082073434125,
+          "accuracy": 0.7602591792656588,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0
+        },
+        "signal_norm": {
+          "auroc": 0.39217342342342343,
+          "aupr": 0.19487807868491286,
+          "accuracy": 0.23974082073434125,
+          "precision": 0.23974082073434125,
+          "recall": 1.0,
+          "f1": 0.3867595818815331
+        }
+      },
+      "mlp": {
+        "auroc": 0.7220004095004096,
+        "aupr": 0.41249625368716636,
+        "accuracy": 0.6889848812095032,
+        "precision": 0.38926174496644295,
+        "recall": 0.5225225225225225,
+        "f1": 0.4461538461538461,
+        "mean_spearman": 0.20734503750416225,
+        "train_time_s": 2.1,
+        "best_train_loss": 0.8162,
+        "best_val_loss": 0.7691,
+        "n_epochs_trained": 44
+      },
+      "transformer": {
+        "auroc": 0.7184172809172809,
+        "aupr": 0.3982911795856722,
+        "accuracy": 0.6911447084233261,
+        "precision": 0.40804597701149425,
+        "recall": 0.6396396396396397,
+        "f1": 0.4982456140350877,
+        "mean_spearman": 0.16884722164232616,
+        "train_time_s": 5.2,
+        "best_train_loss": 0.8105,
+        "best_val_loss": 0.7676,
+        "n_epochs_trained": 43
+      }
+    },
+    "binary_ancestry": {
+      "baselines": {
+        "random": {
+          "auroc": 0.4819771863117871,
+          "aupr": 0.42555638151626785,
+          "accuracy": 0.48596112311015116,
+          "precision": 0.4166666666666667,
+          "recall": 0.475,
+          "f1": 0.4439252336448598
+        },
+        "constant_mean": {
+          "auroc": 0.5,
+          "aupr": 0.4319654427645788,
+          "accuracy": 0.5680345572354212,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0
+        },
+        "signal_norm": {
+          "auroc": 0.44944866920152093,
+          "aupr": 0.3983360555897609,
+          "accuracy": 0.4319654427645788,
+          "precision": 0.4319654427645788,
+          "recall": 1.0,
+          "f1": 0.603318250377074
+        }
+      },
+      "mlp": {
+        "auroc": 0.7206653992395438,
+        "aupr": 0.6435149833380182,
+        "accuracy": 0.6306695464362851,
+        "precision": 0.5555555555555556,
+        "recall": 0.725,
+        "f1": 0.6290672451193059,
+        "mean_spearman": 0.12598339795107105,
+        "train_time_s": 2.5,
+        "best_train_loss": 0.9093,
+        "best_val_loss": 0.9631,
+        "n_epochs_trained": 60
+      },
+      "transformer": {
+        "auroc": 0.6969581749049429,
+        "aupr": 0.658118437630042,
+        "accuracy": 0.5766738660907127,
+        "precision": 0.5068027210884354,
+        "recall": 0.745,
+        "f1": 0.6032388663967612,
+        "mean_spearman": 0.11272134137399258,
+        "train_time_s": 4.1,
+        "best_train_loss": 0.9448,
+        "best_val_loss": 0.9808,
+        "n_epochs_trained": 34
+      }
+    },
+    "graded_ancestry": {
+      "baselines": {
+        "random": {
+          "r2": -0.7246943664599679,
+          "mae": 0.46969361388253983,
+          "correlation": -0.019427860481131296
+        },
+        "constant_mean": {
+          "r2": 0.0,
+          "mae": 0.3792922484127836,
+          "correlation": 0.0
+        },
+        "signal_norm": {
+          "r2": -2.4363442896586,
+          "mae": 0.6634709694730541,
+          "correlation": -0.1320597988882928
+        }
+      },
+      "mlp": {
+        "r2": 0.05102807283401489,
+        "mae": 0.32415512204170227,
+        "correlation": 0.30295499658971153,
+        "mean_spearman": 0.17039216017071038,
+        "train_time_s": 3.4,
+        "best_train_loss": 0.123,
+        "best_val_loss": 0.1212,
+        "n_epochs_trained": 82
+      },
+      "transformer": {
+        "r2": 0.13948500156402588,
+        "mae": 0.31679031252861023,
+        "correlation": 0.3838021937175737,
+        "mean_spearman": 0.16542508699388733,
+        "train_time_s": 8.1,
+        "best_train_loss": 0.1221,
+        "best_val_loss": 0.1209,
+        "n_epochs_trained": 69
+      }
+    },
+    "interventional": {
+      "baselines": {
+        "random": {
+          "r2": -2.1532503224154804,
+          "mae": 0.4426086629961346,
+          "correlation": -0.058533707518479486
+        },
+        "constant_mean": {
+          "r2": 0.0,
+          "mae": 0.2156157660653322,
+          "correlation": 0.0
+        },
+        "signal_norm": {
+          "r2": -7.037735138671211,
+          "mae": 0.7840836447091546,
+          "correlation": -0.046276279196487045
+        }
+      },
+      "mlp": {
+        "r2": 0.08492296934127808,
+        "mae": 0.18540498614311218,
+        "correlation": 0.3050086627867463,
+        "mean_spearman": 0.15459597661670968,
+        "train_time_s": 2.2,
+        "best_train_loss": 0.0815,
+        "best_val_loss": 0.072,
+        "n_epochs_trained": 54
+      },
+      "transformer": {
+        "r2": 0.0422099232673645,
+        "mae": 0.19303230941295624,
+        "correlation": 0.23006136367825017,
+        "mean_spearman": 0.14022892482067603,
+        "train_time_s": 7.1,
+        "best_train_loss": 0.0797,
+        "best_val_loss": 0.0722,
+        "n_epochs_trained": 60
+      }
+    }
+  },
+  "config": {
+    "n_datasets": 193,
+    "n_train": 135,
+    "n_val": 28,
+    "n_test": 30,
+    "max_features": 26,
+    "device": "cuda:0",
+    "data_generation_time_s": 496.7
+  }
+}

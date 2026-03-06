@@ -37,6 +37,11 @@ def evaluate_binary(
     pred_flat = predictions.ravel()
     target_flat = targets.ravel()
 
+    # Remove NaN/Inf values
+    valid_mask = np.isfinite(pred_flat) & np.isfinite(target_flat)
+    pred_flat = pred_flat[valid_mask]
+    target_flat = target_flat[valid_mask]
+
     # Remove padding (zeros in both)
     valid = ~((pred_flat == 0) & (target_flat == 0) & (predictions.ndim > 1))
     if predictions.ndim == 1:
@@ -99,6 +104,11 @@ def evaluate_continuous(
     """
     pred_flat = predictions.ravel()
     target_flat = targets.ravel()
+
+    # Remove NaN/Inf values
+    valid_mask = np.isfinite(pred_flat) & np.isfinite(target_flat)
+    pred_flat = pred_flat[valid_mask]
+    target_flat = target_flat[valid_mask]
 
     metrics: dict[str, float] = {}
     metrics["r2"] = float(r2_score(target_flat, pred_flat))
