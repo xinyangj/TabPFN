@@ -1,20 +1,21 @@
 #!/usr/bin/env python
 """Comprehensive experiment: Train and evaluate the interpretation model.
 
-This script:
-1. Generates synthetic datasets from SCMs with known causal structure
-2. Fits TabPFN on each dataset and extracts internal signals
-3. Trains interpretation models (MLP and Transformer variants)
-4. Evaluates across all 4 label modes
-5. Compares against baselines
-6. Produces a comprehensive performance report
+Loads pre-generated datasets from disk (see generate_interpretation_data.py),
+trains interpretation models (MLP and Transformer), evaluates across 4 label
+modes, runs a feature ablation study, and produces a summary report.
+
+Usage:
+    # First generate data:
+    python scripts/generate_interpretation_data.py --n_datasets 10000
+    # Then run experiment:
+    python scripts/run_interpretation_experiment.py
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
 
@@ -28,97 +29,24 @@ logger = logging.getLogger(__name__)
 RESULTS_DIR = Path("results/interpretation_experiments")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+CACHE_DIR = Path("data/interpretation_cache")
+
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
+
 # ============================================================
-# Phase 1: Generate Training Data
+# Phase 1: Load Data from Disk
 # ============================================================
 
-def generate_training_data(
-    n_datasets: int = 200,
-    n_features_range: tuple[int, int] = (5, 25),
-    n_samples_range: tuple[int, int] = (80, 300),
-    seed: int = 42,
-) -> list[dict]:
-    """Generate synthetic datasets, run TabPFN, extract signals."""
-    from tabpfn import TabPFNRegressor
-    from tabpfn.interpretation.extraction.signal_extractor import SignalExtractor
-    from tabpfn.interpretation.extraction.signal_processor import SignalProcessor
-    from tabpfn.interpretation.synthetic_data.label_generator import compute_all_labels
-    from tabpfn.interpretation.synthetic_data.scm_generator import SCMGenerator
-
-    gen = SCMGenerator(
-        n_features_range=n_features_range,
-        n_samples_range=n_samples_range,
-        seed=seed,
-    )
-    extractor = SignalExtractor(extract_gradients=False)
-    processor = SignalProcessor()
-
-    all_data = []
-    timings = {"scm": [], "tabpfn_fit": [], "extract": [], "process": []}
-
-    for i in range(n_datasets):
-        try:
-            # Step 1: Generate SCM dataset
-            t0 = time.time()
-            dataset = gen.generate()
-            timings["scm"].append(time.time() - t0)
-
-            n_total = dataset.X.shape[0]
-            n_train = max(int(n_total * 0.7), 20)
-            X_train = dataset.X[:n_train].astype(np.float32)
-            X_test = dataset.X[n_train:].astype(np.float32)
-            y_train = dataset.y[:n_train].astype(np.float32)
-
-            # Step 2: Fit TabPFN
-            t0 = time.time()
-            reg = TabPFNRegressor(n_estimators=1, device=DEVICE)
-            reg.fit(X_train, y_train)
-            timings["tabpfn_fit"].append(time.time() - t0)
-
-            # Step 3: Extract signals
-            t0 = time.time()
-            signals = extractor.extract(reg, X_train, y_train, X_test)
-            timings["extract"].append(time.time() - t0)
-
-            # Step 4: Process to feature vectors
-            t0 = time.time()
-            feature_vectors = processor.process(signals)
-            timings["process"].append(time.time() - t0)
-
-            # Step 5: Compute labels
-            labels = compute_all_labels(dataset)
-
-            all_data.append({
-                "feature_vectors": feature_vectors,
-                "labels": labels,
-                "metadata": dataset.metadata,
-            })
-
-            if (i + 1) % 20 == 0:
-                logger.info(
-                    f"Generated {i+1}/{n_datasets} datasets. "
-                    f"Last: n_feat={dataset.X.shape[1]}, "
-                    f"n_parents={dataset.metadata['n_target_parents']}, "
-                    f"feat_dim={feature_vectors.shape[1]}"
-                )
-
-            # Free GPU memory
-            del reg, signals
-            torch.cuda.empty_cache()
-
-        except Exception as e:
-            logger.warning(f"Dataset {i+1} failed: {e}")
-            continue
-
-    logger.info(f"Successfully generated {len(all_data)}/{n_datasets} datasets")
-    logger.info(f"Timings (mean): SCM={np.mean(timings['scm']):.3f}s, "
-                f"TabPFN={np.mean(timings['tabpfn_fit']):.3f}s, "
-                f"Extract={np.mean(timings['extract']):.3f}s, "
-                f"Process={np.mean(timings['process']):.3f}s")
-
-    return all_data
+def load_data(cache_dir: Path = CACHE_DIR) -> list[dict]:
+    """Load pre-generated datasets from disk cache."""
+    import sys
+    # Ensure project root is on path for script imports
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from scripts.generate_interpretation_data import load_all_datasets
+    return load_all_datasets(cache_dir)
 
 
 # ============================================================
@@ -369,23 +297,19 @@ def evaluate_baselines(
 def run_full_experiment():
     """Run the complete experiment suite."""
     logger.info("=" * 60)
-    logger.info("INTERPRETATION MODEL EXPERIMENT")
+    logger.info("INTERPRETATION MODEL EXPERIMENT (v2.5 aligned)")
     logger.info("=" * 60)
 
-    # ---- Data Generation ----
-    logger.info("\n[Phase 1] Generating training data...")
+    # ---- Load Pre-generated Data ----
+    logger.info("\n[Phase 1] Loading pre-generated data from disk...")
     t_start = time.time()
-    all_data = generate_training_data(
-        n_datasets=200,
-        n_features_range=(5, 25),
-        n_samples_range=(80, 300),
-        seed=42,
-    )
-    t_datagen = time.time() - t_start
-    logger.info(f"Data generation took {t_datagen:.1f}s")
+    all_data = load_data()
+    t_load = time.time() - t_start
+    logger.info(f"Loaded {len(all_data)} datasets in {t_load:.1f}s")
 
-    if len(all_data) < 20:
-        logger.error(f"Only {len(all_data)} datasets generated, need at least 20")
+    if len(all_data) < 30:
+        logger.error(f"Only {len(all_data)} datasets available, need at least 30. "
+                      "Run generate_interpretation_data.py first.")
         return
 
     # Split: 70% train, 15% val, 15% test
@@ -415,13 +339,14 @@ def run_full_experiment():
         "n_ancestors_mean": float(np.mean(n_ancestors)),
         "parent_fraction_mean": float(np.mean([p/n for p, n in zip(n_parents, n_features_list)])),
         "ancestor_fraction_mean": float(np.mean([a/n for a, n in zip(n_ancestors, n_features_list)])),
+        "generator": "tabpfn_prior (zzhang-cn/tabpfn-synthetic-data)",
     }
     logger.info(f"Data stats: {json.dumps(data_stats, indent=2)}")
 
     max_features = max(n_features_list) + 1
     input_dim = feat_dims[0]
 
-    # ---- Experiments ----
+    # ---- Main Experiments ----
     label_modes = ["binary_direct", "binary_ancestry", "graded_ancestry", "interventional"]
     model_variants = ["mlp", "transformer"]
 
@@ -467,21 +392,33 @@ def run_full_experiment():
             metrics["best_train_loss"] = round(min(history["train_loss"]), 4)
             metrics["best_val_loss"] = round(min(history["val_loss"]), 4)
             metrics["n_epochs_trained"] = len(history["train_loss"])
+            metrics["loss_history"] = {k: [round(v, 6) for v in vals] for k, vals in history.items()}
 
             mode_results[variant] = metrics
             logger.info(f"    {variant}: {json.dumps({k: round(v, 4) if isinstance(v, float) else v for k, v in metrics.items()})}")
 
-            # Free GPU
             del model
             torch.cuda.empty_cache()
 
         all_results[label_mode] = mode_results
+
+    # ---- Feature Ablation Study ----
+    logger.info("\n" + "=" * 60)
+    logger.info("[Phase 3] Feature Ablation Study")
+    logger.info("=" * 60)
+
+    ablation_results = run_feature_ablation(
+        train_data, val_data, test_data,
+        max_features=max_features,
+        label_modes=label_modes,
+    )
 
     # ---- Save Results ----
     results_file = RESULTS_DIR / "experiment_results.json"
     full_results = {
         "data_stats": data_stats,
         "results": all_results,
+        "ablation": ablation_results,
         "config": {
             "n_datasets": len(all_data),
             "n_train": len(train_data),
@@ -489,7 +426,8 @@ def run_full_experiment():
             "n_test": len(test_data),
             "max_features": max_features,
             "device": DEVICE,
-            "data_generation_time_s": round(t_datagen, 1),
+            "data_load_time_s": round(t_load, 1),
+            "generator": "tabpfn_prior",
         },
     }
     with open(results_file, "w") as f:
@@ -500,6 +438,112 @@ def run_full_experiment():
     print_summary(full_results)
 
     return full_results
+
+
+# ============================================================
+# Feature Ablation Study
+# ============================================================
+
+ABLATION_CONFIGS: dict[str, set[str] | None] = {
+    "full": None,  # all categories (use pre-computed feature_vectors)
+    "attention_only": {"between_features_attention", "between_items_attention"},
+    "feat_attn_only": {"between_features_attention"},
+    "item_attn_only": {"between_items_attention"},
+    "embeddings_only": {"embeddings"},
+    "mlp_only": {"mlp_activations"},
+    "gradients_only": {"gradients"},
+    "no_attention": {"embeddings", "mlp_activations", "gradients"},
+    "no_embeddings": {"between_features_attention", "between_items_attention", "mlp_activations", "gradients"},
+    "no_gradients": {"between_features_attention", "between_items_attention", "embeddings", "mlp_activations"},
+}
+
+
+def run_feature_ablation(
+    train_data: list[dict],
+    val_data: list[dict],
+    test_data: list[dict],
+    *,
+    max_features: int,
+    label_modes: list[str],
+) -> dict:
+    """Run the feature ablation study across signal category subsets.
+
+    Uses pre-computed per-category feature vectors stored on disk.
+    """
+    ablation_results: dict[str, dict] = {}
+
+    for config_name, categories in ABLATION_CONFIGS.items():
+        logger.info(f"\n  Ablation: {config_name} (categories={categories or 'all'})")
+
+        try:
+            abl_train = _select_categories(train_data, categories)
+            abl_val = _select_categories(val_data, categories)
+            abl_test = _select_categories(test_data, categories)
+        except Exception as e:
+            logger.warning(f"    Ablation {config_name} failed: {e}")
+            continue
+
+        input_dim = abl_train[0]["feature_vectors"].shape[1]
+        logger.info(f"    input_dim={input_dim}")
+
+        config_results: dict[str, dict] = {"input_dim": input_dim}
+
+        for label_mode in label_modes:
+            logger.info(f"    Training MLP for {label_mode}...")
+            try:
+                model, history = train_model(
+                    abl_train, abl_val,
+                    variant="mlp",
+                    label_mode=label_mode,
+                    max_features=max_features,
+                    n_epochs=80,
+                    batch_size=16,
+                    lr=5e-4,
+                )
+                metrics = evaluate_model(model, abl_test, label_mode, max_features)
+                metrics["best_val_loss"] = round(min(history["val_loss"]), 4)
+                metrics["loss_history"] = {k: [round(v, 6) for v in vals] for k, vals in history.items()}
+                config_results[label_mode] = metrics
+                logger.info(f"      {label_mode}: {json.dumps({k: round(v, 4) if isinstance(v, float) else v for k, v in metrics.items()})}")
+
+                del model
+                torch.cuda.empty_cache()
+            except Exception as e:
+                logger.warning(f"      {label_mode} failed: {e}")
+                config_results[label_mode] = {"error": str(e)}
+
+        ablation_results[config_name] = config_results
+
+    return ablation_results
+
+
+def _select_categories(
+    data: list[dict],
+    categories: set[str] | None,
+) -> list[dict]:
+    """Build feature vectors by concatenating selected per-category vectors.
+
+    If *categories* is None, returns the original full feature_vectors.
+    """
+    if categories is None:
+        return data
+
+    result = []
+    for record in data:
+        cat_vecs = record.get("category_vectors", {})
+        parts = []
+        for cat in sorted(categories):
+            if cat in cat_vecs:
+                parts.append(cat_vecs[cat])
+        if not parts:
+            raise ValueError(f"No category vectors found for {categories}")
+        fv = np.concatenate(parts, axis=1)
+        result.append({
+            "feature_vectors": fv,
+            "labels": record["labels"],
+            "metadata": record["metadata"],
+        })
+    return result
 
 
 def print_summary(results: dict):
@@ -515,6 +559,7 @@ def print_summary(results: dict):
     print(f"  Feature dim (D_total): {ds['feature_dim']}")
     print(f"  Direct parents per dataset: {ds['n_direct_parents_mean']:.1f} ({ds['parent_fraction_mean']*100:.1f}% of features)")
     print(f"  Total ancestors per dataset: {ds['n_ancestors_mean']:.1f} ({ds['ancestor_fraction_mean']*100:.1f}% of features)")
+    print(f"  Generator: {ds.get('generator', 'unknown')}")
 
     for label_mode, mode_results in results["results"].items():
         is_binary = label_mode in ("binary_direct", "binary_ancestry")
@@ -543,6 +588,37 @@ def print_summary(results: dict):
                 corr = metrics.get("correlation", 0)
                 spear = metrics.get("mean_spearman", metrics.get("spearman", 0))
                 print(f"  {method:<23} {r2:>8.4f} {mae:>8.4f} {corr:>8.4f} {spear:>10.4f}")
+
+    # Ablation summary
+    ablation = results.get("ablation", {})
+    if ablation:
+        print(f"\n{'=' * 80}")
+        print("FEATURE ABLATION STUDY")
+        print(f"{'=' * 80}")
+
+        # For binary_direct (AUROC)
+        print(f"\n{'Config':<22} {'Dims':>5}  ", end="")
+        label_modes = ["binary_direct", "binary_ancestry", "graded_ancestry", "interventional"]
+        metric_names = ["AUROC", "AUROC", "R²", "R²"]
+        for mn in metric_names:
+            print(f"  {mn:>8}", end="")
+        print()
+        print("─" * 70)
+
+        for config_name, config_data in ablation.items():
+            dims = config_data.get("input_dim", "?")
+            print(f"  {config_name:<20} {dims:>5}  ", end="")
+            for lm in label_modes:
+                m = config_data.get(lm, {})
+                if isinstance(m, dict) and "error" not in m:
+                    if lm in ("binary_direct", "binary_ancestry"):
+                        val = m.get("auroc", 0)
+                    else:
+                        val = m.get("r2", 0)
+                    print(f"  {val:>8.4f}", end="")
+                else:
+                    print(f"  {'N/A':>8}", end="")
+            print()
 
     print("\n" + "=" * 80)
 
