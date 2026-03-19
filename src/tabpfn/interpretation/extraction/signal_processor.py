@@ -243,6 +243,7 @@ class SignalProcessor:
             fv = self._gather_mlp_stats(
                 gpu_stats["mlp_block_stats"],
                 n_features,
+                cross_layer_data=gpu_stats.get("mlp_cross_layer"),
             )
             if fv is not None:
                 feature_parts.append(fv)
@@ -315,18 +316,51 @@ class SignalProcessor:
         self,
         block_stats: np.ndarray,
         n_features: int,
+        *,
+        cross_layer_data: np.ndarray | None = None,
     ) -> np.ndarray | None:
         """Gather pre-computed MLP stats to per-feature vectors.
 
         block_stats: (n_layers, n_feat_blocks, n_stats)
+        cross_layer_data: (n_feat_blocks, 3) — GPU-computed cross-layer stats, optional.
+        If enriched, appends 3 cross-layer stats.
         """
+        n_layers = block_stats.shape[0]
         n_feat_blocks = block_stats.shape[1]
 
         bi_arr = np.array([min(i * n_feat_blocks // max(n_features, 1), n_feat_blocks - 1)
                            for i in range(n_features)])
 
         gathered = block_stats[:, bi_arr, :]
-        return gathered.transpose(1, 0, 2).reshape(n_features, -1).astype(np.float32)
+        per_layer = gathered.transpose(1, 0, 2).reshape(n_features, -1)
+
+        if self.enriched:
+            if cross_layer_data is not None:
+                # Use GPU-computed cross-layer stats
+                cross = cross_layer_data[bi_arr]  # (n_features, 3)
+            else:
+                # Fallback: compute from norms in block_stats (stat index 4)
+                norms_feat = block_stats[:, bi_arr, 4]  # (n_layers, n_features)
+                cross = np.zeros((n_features, 3), dtype=np.float32)
+
+                if n_layers > 1:
+                    x_arr = np.arange(n_layers, dtype=np.float32)
+                    x_mean = x_arr.mean()
+                    x_var = ((x_arr - x_mean) ** 2).sum()
+                    if x_var > 0:
+                        cross[:, 0] = (
+                            (x_arr[:, None] - x_mean) *
+                            (norms_feat - norms_feat.mean(axis=0))
+                        ).sum(axis=0) / x_var
+
+                first_norms = norms_feat[0]
+                last_norms = norms_feat[-1]
+                cross[:, 1] = 1.0  # placeholder — cosine needs raw acts
+                cross[:, 2] = last_norms / (first_norms + 1e-10)
+
+            return np.concatenate([per_layer, cross], axis=1).astype(np.float32)
+
+        return per_layer.astype(np.float32)
 
     def _gather_gradient_stats(
         self,
@@ -350,14 +384,36 @@ class SignalProcessor:
             n_grad_feats = min(grads_np.shape[1], n_features)
             abs_grads = np.abs(grads_np[:, :n_grad_feats])
 
-            input_stats = np.zeros((n_features, 4), dtype=np.float32)
-            input_stats[:n_grad_feats, 0] = abs_grads.mean(axis=0)
-            input_stats[:n_grad_feats, 1] = abs_grads.max(axis=0)
-            input_stats[:n_grad_feats, 2] = grads_np[:, :n_grad_feats].std(axis=0)
+            n_input_stats = 8 if self.enriched else 4
+            input_stats = np.zeros((n_features, n_input_stats), dtype=np.float32)
+
+            abs_mean = abs_grads.mean(axis=0)
+            input_stats[:n_grad_feats, 0] = abs_mean                              # 1. abs_mean
+            input_stats[:n_grad_feats, 1] = abs_grads.max(axis=0)                 # 2. abs_max
+            input_stats[:n_grad_feats, 2] = grads_np[:, :n_grad_feats].std(axis=0)  # 3. std
             pos_frac = (grads_np[:, :n_grad_feats] > 0).mean(axis=0)
-            input_stats[:n_grad_feats, 3] = np.maximum(pos_frac, 1.0 - pos_frac)
+            input_stats[:n_grad_feats, 3] = np.maximum(pos_frac, 1.0 - pos_frac)  # 4. dominance
             if n_grad_feats < n_features:
                 input_stats[n_grad_feats:, 3] = 0.5
+
+            if self.enriched:
+                # 5. rank: percentile rank of abs_mean among all features
+                total_abs = abs_mean.sum()
+                n_others = max(n_grad_feats - 1, 1)
+                others_mean = (total_abs - abs_mean) / n_others
+                input_stats[:n_grad_feats, 4] = np.array([
+                    (abs_mean <= abs_mean[i]).mean() for i in range(n_grad_feats)
+                ])
+                # 6. contrast: abs_mean - mean(others)
+                input_stats[:n_grad_feats, 5] = abs_mean - others_mean
+                # 7. abs_median
+                input_stats[:n_grad_feats, 6] = np.median(abs_grads, axis=0)
+                # 8. grad_energy
+                input_stats[:n_grad_feats, 7] = (grads_np[:, :n_grad_feats] ** 2).mean(axis=0)
+
+                if n_grad_feats < n_features:
+                    input_stats[n_grad_feats:, 4] = 0.5  # rank default
+
             parts.append(input_stats)
 
         # Attention gradient block stats (pre-computed)

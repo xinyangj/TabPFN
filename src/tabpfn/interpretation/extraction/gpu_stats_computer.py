@@ -40,11 +40,12 @@ class GPUStatsComputer:
             SignalProcessor.process_from_stats().
         """
         result: dict[str, Any] = {}
+        n_train = signals.get("n_train", 0)
 
         # Between-items attention stats
         items_attn = signals.get("between_items_attention")
         if items_attn and isinstance(items_attn, dict):
-            stats = self._compute_items_attention_stats(items_attn)
+            stats = self._compute_items_attention_stats(items_attn, n_train=n_train)
             if stats is not None:
                 result["items_attention_block_stats"] = stats
 
@@ -66,9 +67,11 @@ class GPUStatsComputer:
         # MLP activation stats
         mlp_act = signals.get("mlp_activations")
         if mlp_act and isinstance(mlp_act, dict):
-            stats = self._compute_mlp_stats(mlp_act)
-            if stats is not None:
-                result["mlp_block_stats"] = stats
+            mlp_result = self._compute_mlp_stats(mlp_act)
+            if mlp_result is not None:
+                result["mlp_block_stats"] = mlp_result["block_stats"]
+                if "cross_layer" in mlp_result:
+                    result["mlp_cross_layer"] = mlp_result["cross_layer"]
 
         # Small tensors: transfer directly to CPU
         for key in ("train_embeddings", "test_embeddings", "input_gradients"):
@@ -97,11 +100,13 @@ class GPUStatsComputer:
         return result
 
     def _compute_items_attention_stats(
-        self, attention_dict: dict[str, torch.Tensor | None]
+        self, attention_dict: dict[str, torch.Tensor | None],
+        *, n_train: int = 0,
     ) -> np.ndarray | None:
         """Compute per-block stats for between-items attention on GPU.
 
         Returns: (n_layers, n_blocks, n_heads, n_stats) numpy array.
+        n_stats = 9 if enriched, 3 otherwise.
         """
         layer_tensors = []
         for key in sorted(attention_dict.keys()):
@@ -116,8 +121,10 @@ class GPUStatsComputer:
 
         n_layers = len(layer_tensors)
         n_blocks = layer_tensors[0].shape[0]
+        n_items = layer_tensors[0].shape[1]
         n_heads = layer_tensors[0].shape[3]
-        n_stats = 3  # enriched=False: entropy, max, var
+        n_stats = 9 if self.enriched else 3
+        has_split = n_train > 0 and n_train < n_items
 
         device = layer_tensors[0].device
         block_stats = torch.zeros(n_layers, n_blocks, n_heads, n_stats, device=device)
@@ -133,6 +140,25 @@ class GPUStatsComputer:
             block_stats[li, :, :, 1] = af.max(dim=1).values
             block_stats[li, :, :, 2] = af.var(dim=1)
 
+            if self.enriched and has_split:
+                for h in range(n_heads):
+                    ah = at[:, :, :, h]  # (n_blocks, n_items, n_items)
+                    # 4. train_to_test
+                    t2t = ah[:, :n_train, n_train:].mean(dim=(1, 2))
+                    block_stats[li, :, h, 3] = t2t
+                    # 5. test_to_train
+                    block_stats[li, :, h, 4] = ah[:, n_train:, :n_train].mean(dim=(1, 2))
+                    # 6. self_train
+                    self_train = ah[:, :n_train, :n_train].mean(dim=(1, 2))
+                    block_stats[li, :, h, 5] = self_train
+                    # 7. self_test
+                    block_stats[li, :, h, 6] = ah[:, n_train:, n_train:].mean(dim=(1, 2))
+                    # 8. train_test_ratio
+                    block_stats[li, :, h, 7] = t2t / (self_train + 1e-10)
+                    # 9. concentration: max / mean_row_sum
+                    row_sums = ah.sum(dim=2).mean(dim=1)  # (n_blocks,)
+                    block_stats[li, :, h, 8] = af[:, :, h].max(dim=1).values / (row_sums + 1e-10)
+
         return block_stats.cpu().numpy()
 
     def _compute_features_attention_stats(
@@ -141,7 +167,8 @@ class GPUStatsComputer:
         """Compute per-block stats for between-features attention on GPU.
 
         Returns dict with:
-          'features_attention_block_stats': (n_layers, n_feat_blocks, n_heads, 6)
+          'features_attention_block_stats': (n_layers, n_feat_blocks, n_heads, n_stats)
+              n_stats = 15 if enriched, 6 otherwise
           'features_to_target_per_layer': (n_layers, n_feat_blocks) for cross-layer
         """
         layer_tensors = []
@@ -161,7 +188,7 @@ class GPUStatsComputer:
         n_heads = layer_tensors[0].shape[3]
         target_block = n_blocks - 1
         n_feat_blocks = n_blocks - 1
-        n_stats = 6  # enriched=False
+        n_stats = 15 if self.enriched else 6
 
         device = layer_tensors[0].device
         block_stats = torch.zeros(n_layers, n_feat_blocks, n_heads, n_stats, device=device)
@@ -178,25 +205,81 @@ class GPUStatsComputer:
                 # 1. self-attention: diagonal
                 block_stats[li, :, h, 0] = torch.diagonal(ah)[:n_feat_blocks]
                 # 2. to_target
-                block_stats[li, :, h, 1] = feat_ah[:, target_block]
+                to_target = feat_ah[:, target_block]
+                block_stats[li, :, h, 1] = to_target
                 # 3. from_target
-                block_stats[li, :, h, 2] = ah[target_block, :n_feat_blocks]
+                from_target = ah[target_block, :n_feat_blocks]
+                block_stats[li, :, h, 2] = from_target
 
                 if n_feat_blocks > 1:
                     out_to_feats = feat_ah[:, :n_feat_blocks]  # (n_fb, n_fb)
+                    in_from_feats = ah[:n_feat_blocks, :n_feat_blocks]  # same as out_to_feats for symmetric
                     diag_vals = torch.diagonal(out_to_feats)
                     row_sums = out_to_feats.sum(dim=1)
                     col_sums = out_to_feats.sum(dim=0)
                     n_others = max(n_feat_blocks - 1, 1)
 
                     # 4. mean_to_others
-                    block_stats[li, :, h, 3] = (row_sums - diag_vals) / n_others
+                    mean_to_others = (row_sums - diag_vals) / n_others
+                    block_stats[li, :, h, 3] = mean_to_others
                     # 5. mean_from_others
                     block_stats[li, :, h, 4] = (col_sums - diag_vals) / n_others
+
+                    if self.enriched:
+                        # For per-block masked stats, use masking via setting diagonal to -inf/0
+                        # 7. max_to_others: max of outgoing excluding self
+                        out_masked = out_to_feats.clone()
+                        out_masked.fill_diagonal_(-float('inf'))
+                        block_stats[li, :, h, 6] = out_masked.max(dim=1).values
+
+                        # 8. std_to_others
+                        # Replace -inf with 0 for std computation
+                        out_for_std = out_to_feats.clone()
+                        out_for_std.fill_diagonal_(0.0)
+                        out_sum = out_for_std.sum(dim=1)
+                        out_sq_sum = (out_for_std ** 2).sum(dim=1)
+                        out_mean = out_sum / n_others
+                        block_stats[li, :, h, 7] = ((out_sq_sum / n_others - out_mean ** 2).clamp(min=0)).sqrt()
+
+                        # 9. max_from_others: max of incoming excluding self
+                        in_masked = in_from_feats.clone()
+                        in_masked.fill_diagonal_(-float('inf'))
+                        block_stats[li, :, h, 8] = in_masked.max(dim=0).values
+
+                        # 10. std_from_others
+                        in_for_std = in_from_feats.clone()
+                        in_for_std.fill_diagonal_(0.0)
+                        in_sum = in_for_std.sum(dim=0)
+                        in_sq_sum = (in_for_std ** 2).sum(dim=0)
+                        in_mean = in_sum / n_others
+                        block_stats[li, :, h, 9] = ((in_sq_sum / n_others - in_mean ** 2).clamp(min=0)).sqrt()
+
+                        # 11. mean_asymmetry: mean of (out[bi,j] - in[j,bi]) for j≠bi
+                        asym = out_to_feats - in_from_feats.T  # (n_fb, n_fb)
+                        asym_masked = asym.clone()
+                        asym_masked.fill_diagonal_(0.0)
+                        block_stats[li, :, h, 10] = asym_masked.sum(dim=1) / n_others
+
+                        # 12. max_abs_asymmetry
+                        asym_abs_masked = asym.abs().clone()
+                        asym_abs_masked.fill_diagonal_(0.0)
+                        block_stats[li, :, h, 11] = asym_abs_masked.max(dim=1).values
 
                 # 6. entropy
                 a_clamped = mean_at[:n_feat_blocks, :, h].clamp(min=1e-10)
                 block_stats[li, :, h, 5] = -(a_clamped * a_clamped.log()).sum(dim=1)
+
+                if self.enriched:
+                    # 13. target_out_rank: fraction of outgoing attns <= to_target
+                    out_row = ah[:n_feat_blocks, :]  # (n_fb, n_blocks)
+                    block_stats[li, :, h, 12] = (out_row <= to_target.unsqueeze(1)).float().mean(dim=1)
+
+                    # 14. target_in_rank: fraction of incoming attns <= from_target
+                    in_col = ah[:, :n_feat_blocks].T  # (n_fb, n_blocks)
+                    block_stats[li, :, h, 13] = (in_col <= from_target.unsqueeze(1)).float().mean(dim=1)
+
+                    # 15. contrast_to_target = to_target - mean_to_others
+                    block_stats[li, :, h, 14] = to_target - block_stats[li, :, h, 3]
 
             # to_target cross-layer: mean over heads
             to_target_per_layer[li] = mean_at[:n_feat_blocks, target_block, :].mean(dim=-1)
@@ -208,10 +291,12 @@ class GPUStatsComputer:
 
     def _compute_mlp_stats(
         self, activation_dict: dict[int, torch.Tensor]
-    ) -> np.ndarray | None:
+    ) -> dict[str, np.ndarray] | None:
         """Compute per-block stats for MLP activations on GPU.
 
-        Returns: (n_layers, n_feat_blocks, 5) numpy array.
+        Returns dict with:
+          'block_stats': (n_layers, n_feat_blocks, n_stats) — n_stats=10 if enriched, 5 otherwise
+          'cross_layer': (n_feat_blocks, 3) — only if enriched (norm_trend, cosine_first_last, norm_ratio)
         """
         sorted_layers = sorted(activation_dict.keys())
         if not sorted_layers:
@@ -220,11 +305,16 @@ class GPUStatsComputer:
         first_act = activation_dict[sorted_layers[0]]
         n_blocks = first_act.shape[2]
         n_feat_blocks = n_blocks - 1
+        target_block = n_blocks - 1
         n_layers = len(sorted_layers)
-        n_stats = 5  # enriched=False
+        n_stats = 10 if self.enriched else 5
 
         device = first_act.device
         block_stats = torch.zeros(n_layers, n_feat_blocks, n_stats, device=device)
+
+        # Store per-block averaged activations for cross-layer stats
+        if self.enriched:
+            feat_acts_per_layer = []
 
         for li, layer_idx in enumerate(sorted_layers):
             act = activation_dict[layer_idx].float()
@@ -232,13 +322,72 @@ class GPUStatsComputer:
             act_avg = act.mean(dim=(0, 1))  # (n_blocks, emsize)
             feat_acts = act_avg[:n_feat_blocks]  # (n_feat_blocks, emsize)
 
-            block_stats[li, :, 0] = feat_acts.mean(dim=1)        # mean
-            block_stats[li, :, 1] = feat_acts.std(dim=1)          # std
-            block_stats[li, :, 2] = feat_acts.max(dim=1).values   # max
-            block_stats[li, :, 3] = (feat_acts.abs() < 0.01).float().mean(dim=1)  # sparsity
-            block_stats[li, :, 4] = feat_acts.norm(dim=1)         # L2 norm
+            block_stats[li, :, 0] = feat_acts.mean(dim=1)        # 1. mean
+            block_stats[li, :, 1] = feat_acts.std(dim=1)          # 2. std
+            block_stats[li, :, 2] = feat_acts.max(dim=1).values   # 3. max
+            block_stats[li, :, 3] = (feat_acts.abs() < 0.01).float().mean(dim=1)  # 4. sparsity
+            norms = feat_acts.norm(dim=1)
+            block_stats[li, :, 4] = norms                         # 5. L2 norm
 
-        return block_stats.cpu().numpy()
+            if self.enriched:
+                feat_acts_per_layer.append(feat_acts.detach())
+                target_act = act_avg[target_block]  # (emsize,)
+
+                # 6. cosine_to_target
+                target_norm = target_act.norm() + 1e-10
+                dot_products = (feat_acts * target_act.unsqueeze(0)).sum(dim=1)
+                block_stats[li, :, 5] = dot_products / (norms * target_norm + 1e-10)
+
+                # 7. diff_from_mean
+                all_blocks_mean = feat_acts.mean(dim=0)  # (emsize,)
+                block_stats[li, :, 6] = (feat_acts - all_blocks_mean.unsqueeze(0)).norm(dim=1)
+
+                # 8. min
+                block_stats[li, :, 7] = feat_acts.min(dim=1).values
+
+                # 9. skewness
+                stds = block_stats[li, :, 1]
+                means = block_stats[li, :, 0]
+                centered = feat_acts - means.unsqueeze(1)
+                safe_stds = torch.where(stds > 1e-10, stds, torch.ones_like(stds))
+                skew = (centered ** 3).mean(dim=1) / (safe_stds ** 3)
+                block_stats[li, :, 8] = torch.where(stds > 1e-10, skew, torch.zeros_like(skew))
+
+                # 10. pos_frac
+                block_stats[li, :, 9] = (feat_acts > 0).float().mean(dim=1)
+
+        result = {"block_stats": block_stats.cpu().numpy()}
+
+        if self.enriched and n_layers > 0:
+            # Cross-layer stats (3 per block): norm_trend, cosine_first_last, norm_ratio
+            norms_all = block_stats[:, :, 4]  # (n_layers, n_feat_blocks) on GPU
+            cross = torch.zeros(n_feat_blocks, 3, device=device)
+
+            if n_layers > 1:
+                x_arr = torch.arange(n_layers, dtype=torch.float32, device=device)
+                x_mean = x_arr.mean()
+                x_var = ((x_arr - x_mean) ** 2).sum()
+                if x_var > 0:
+                    # norm_trend
+                    cross[:, 0] = (
+                        (x_arr.unsqueeze(1) - x_mean) *
+                        (norms_all - norms_all.mean(dim=0, keepdim=True))
+                    ).sum(dim=0) / x_var
+
+            # cosine_first_last
+            first_acts = feat_acts_per_layer[0]   # (n_feat_blocks, emsize)
+            last_acts = feat_acts_per_layer[-1]
+            dot = (first_acts * last_acts).sum(dim=1)
+            fn = first_acts.norm(dim=1) + 1e-10
+            ln = last_acts.norm(dim=1) + 1e-10
+            cross[:, 1] = dot / (fn * ln)
+
+            # norm_ratio
+            cross[:, 2] = ln / (fn + 1e-10)
+
+            result["cross_layer"] = cross.cpu().numpy()
+
+        return result
 
     def _compute_attn_gradient_stats(
         self, gradient_dict: dict[str, torch.Tensor | None]
