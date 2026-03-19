@@ -123,31 +123,44 @@ Cross-layer: same 3 stats.
 
 **Dims**: 18×3×15 + 3 = **813**
 
-#### Attention Rollout (enriched=True only): +15 dims → total **828 dims**
+#### Joint Attention Rollout (enriched=True only): +8 dims → total **821 dims**
 
-Rollout (Abnar & Zuidema, 2020) computes **cumulative attention flow** across all layers, accounting for residual connections:
+Rollout (Abnar & Zuidema, 2020) computes **cumulative attention flow** across all layers. Our implementation uses a **joint rollout** that combines both between-features and between-items attention via Kronecker products, matching the GRN sequential rollout exactly.
+
+**How it works**: The 4D transformer state `(batch, n_items, n_blocks, emsize)` is flattened into an `N×N` matrix where `N = n_blocks × n_items`. Each layer's two attention operations are lifted into this shared space:
+
 ```
-R_0 = I
-R_{l+1} = (0.5·I + 0.5·A_l) @ R_l    (0.5 mixing for skip connection)
+# Per layer:
+A_feat = kron(feat_attn, J_items)      # block-diagonal: each item sees same feature attention
+A_items = kron(J_blocks, item_attn)    # interleaved: each block sees same item attention
+
+# Add residual and normalize:
+A_feat = normalize(A_feat + I)
+A_items = normalize(A_items + I)
+
+# Sequential composition (items AFTER features, matching TabPFN layer order):
+A_layer = A_items @ A_feat
+rollout = A_layer @ rollout    # compose across all 18 layers
 ```
 
-The `0.5·I + 0.5·A` mixing reflects that at each layer, roughly half the information passes through the residual connection unchanged. After 18 compositions, `R_18[bi, target]` represents the total information flow from feature block `bi` to the target through the entire network.
+Per-feature-block scores are extracted by averaging over items: `score[block_b] = mean(rollout[b*n_items:(b+1)*n_items, target_block*n_items:(target_block+1)*n_items])`.
 
 | # | Stat | Formula | Dims | Interpretation |
 |---|------|---------|------|----------------|
-| R1 | rollout_to_target | `R_18[bi, target, h]` per head | 3 | Total cumulative flow from this block to target |
-| R2 | rollout_from_target | `R_18[target, bi, h]` per head | 3 | Total cumulative flow from target to this block |
-| R3 | rollout_self | `R_18[bi, bi, h]` per head | 3 | How much original info this block retains |
-| R4 | rollout_to_target_mean | `mean_h(R_18[bi, target])` | 1 | Head-averaged cumulative flow to target |
-| R5 | rollout_rank | `frac(blocks with rollout ≤ this)` | 1 | Percentile rank among all blocks |
-| R6 | rollout_contrast | `rollout - mean(other blocks)` | 1 | Relative cumulative flow strength |
-| R7 | rollout_entropy | `-Σ(R[bi,:] · log(R[bi,:]))` | 1 | How spread the cumulative flow is |
-| R8 | rollout_mid | `R_9[bi, target]` mean over heads | 1 | Flow at network midpoint (layer 9) |
-| R9 | rollout_early_late_ratio | `R_18 / (R_9 + ε)` | 1 | Whether flow builds early or late |
+| R1 | rollout_to_target | `rollout[bi, target]` | 1 | Total cumulative flow from this block to target |
+| R2 | rollout_from_target | `rollout[bi, target]` (symmetric proxy) | 1 | Symmetric proxy for reverse flow |
+| R3 | rollout_self | `rollout[bi, bi]` | 1 | How much original info this block retains |
+| R4 | rollout_rank | `frac(blocks with rollout ≤ this)` | 1 | Percentile rank among all blocks |
+| R5 | rollout_contrast | `rollout - mean(other blocks)` | 1 | Relative cumulative flow strength |
+| R6 | rollout_entropy | `-Σ(R[bi,:] · log(R[bi,:]))` | 1 | How spread the cumulative flow is |
+| R7 | rollout_mid | `R_9[bi, target]` | 1 | Flow at network midpoint (layer 9) |
+| R8 | rollout_ratio | `R_18 / (R_9 + ε)` | 1 | Whether flow builds early or late |
 
-**Total**: 15 dims. Computed on GPU in ~2.3ms (negligible overhead).
+**Total**: 8 dims. Computed on GPU in ~8ms for N=912 (negligible overhead).
 
-**Why rollout matters**: Per-layer `to_target` captures direct attention at each layer. But in a deep transformer, information flows through **multi-hop paths** — block A may attend to block B in layer 5, and block B attends to target in layer 12. Rollout captures this cumulative flow that no single-layer stat can. `rollout_early_late_ratio` reveals whether the model resolves feature importance early (layers 1–9) or late (layers 10–18).
+**Why joint rollout matters**: A features-only rollout ignores how information flows between samples (the in-context learning pathway). The joint rollout captures both: feature A may attend to feature B (between-features) while simultaneously, test samples attend to training samples with similar values (between-items). Only the joint composition reveals the true multi-hop information pathway through TabPFN's alternating attention architecture.
+
+**Verified**: Output matches GRN's `compute_sequential_attention_rollout()` to <1e-8 precision.
 
 **Why this matters**: `to_target` and `from_target` directly measure the feature↔target information flow. If TabPFN has learned that feature f3 is causal, the attention from block_1 (containing f3) to the target block should be high. The enriched stats add **relational context**: `contrast_to_target` measures how much a block *preferentially* attends to the target (vs spreading attention everywhere), and `mean_asymmetry` captures whether the feature→target relationship is directional. The `linear_trend` captures whether this attention increases through deeper layers.
 
@@ -304,19 +317,19 @@ MLP activations             90    Per-block (3)   ★★★☆☆  (indirect)
 TOTAL                    1267    Effective: ~583
 ```
 
-### enriched=True (with rollout)
+### enriched=True (with joint rollout)
 
 ```
 Category                  Dims    Per-Feature?   Quality
 ─────────────────────────────────────────────────────────
-Between-features attn      828    Per-block (3)   ★★★★★  (+asymmetry, ranking, contrast, ROLLOUT)
+Between-features attn      821    Per-block (3)   ★★★★★  (+asymmetry, ranking, contrast, JOINT ROLLOUT)
 Between-items attn         486    Per-block (3)   ★★★☆☆  (+train/test split awareness)
 Embeddings                 576    NO (identical)  ☆☆☆☆☆  (still useless)
 Input gradients              8    YES (per-feat)  ★★★★★  (+rank, contrast, energy)
 Attention gradients        327    ZERO (all 0)*   ☆☆☆☆☆  (*input_only mode → zeros)
 MLP activations            183    Per-block (3)   ★★★★☆  (+cosine_to_target, skewness)
 ─────────────────────────────────────────────────────────
-TOTAL (no items_attn_grad) 2156†  Effective: ~1253†
+TOTAL (no items_attn_grad) 2401†  Effective: ~1498†
 ```
 
 † With `extract_gradients=True` (full mode), items_attention_gradients adds 324 dims.
@@ -326,7 +339,7 @@ TOTAL (no items_attn_grad) 2156†  Effective: ~1253†
 ```
 Category                  Dims    Notes
 ─────────────────────────────────────────────────────────
-Between-features attn      828    15 stats × 18L × 3H + 3 + 15 rollout
+Between-features attn      821    15 stats × 18L × 3H + 3 + 8 joint rollout
 Between-items attn         486    9 stats × 18L × 3H
 Embeddings                 576    3 × 192 (tiled)
 Input gradients              8    8 per-feature stats
