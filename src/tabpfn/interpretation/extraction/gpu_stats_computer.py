@@ -55,11 +55,13 @@ class GPUStatsComputer:
             if stats is not None:
                 result.update(stats)
 
-            # Attention rollout (enriched mode only)
+            # Attention rollout (enriched mode only, needs both attention types)
             if self.enriched:
-                rollout = self._compute_rollout(feat_attn)
-                if rollout is not None:
-                    result.update(rollout)
+                items_attn = signals.get("between_items_attention")
+                if items_attn and isinstance(items_attn, dict):
+                    rollout = self._compute_rollout(feat_attn, items_attn)
+                    if rollout is not None:
+                        result.update(rollout)
 
         # MLP activation stats
         mlp_act = signals.get("mlp_activations")
@@ -289,55 +291,156 @@ class GPUStatsComputer:
         return block_stats.cpu().numpy()
 
     def _compute_rollout(
-        self, attention_dict: dict[str, torch.Tensor | None]
+        self,
+        feat_attn_dict: dict[str, torch.Tensor | None],
+        items_attn_dict: dict[str, torch.Tensor | None],
     ) -> dict[str, np.ndarray] | None:
-        """Compute attention rollout across all layers on GPU.
+        """Compute joint attention rollout across all layers on GPU.
 
-        Rollout (Abnar & Zuidema, 2020) composes attention matrices across
-        layers, accounting for residual connections via 0.5*I + 0.5*A mixing:
-            R_0 = I
-            R_{l+1} = (0.5*I + 0.5*A_l) @ R_l
+        Combines both between-features and between-items attention into a
+        joint N×N rollout matrix (N = n_items × n_blocks) following the
+        GRN sequential rollout approach.  Per layer:
+
+            A_feat = normalize(kron(feat_2d, J_blocks) + I)
+            A_items = normalize(kron(J_items, item_2d) + I)
+            A_layer = A_items @ A_feat
+            rollout = A_layer @ rollout
+
+        Extracts per-feature-block scores by averaging over items.
 
         Returns dict with:
-          'rollout_final': (n_feat_blocks, n_blocks, n_heads) — full rollout
-          'rollout_mid': (n_feat_blocks, n_heads) — rollout_to_target at mid-layer
+          'rollout_final': (n_feat_blocks, n_blocks, 1) — per-block rollout
+            to all block positions (averaged over items and heads)
+          'rollout_mid': (n_feat_blocks, 1) — rollout_to_target at mid-layer
         """
-        layer_tensors = []
-        for key in sorted(attention_dict.keys()):
-            attn = attention_dict[key]
-            if attn is not None and isinstance(attn, torch.Tensor):
-                a = attn.float()
-                a = torch.nan_to_num(a, nan=0.0)
-                layer_tensors.append(a)
+        feat_layers = []
+        items_layers = []
+        for key in sorted(feat_attn_dict.keys()):
+            fa = feat_attn_dict[key]
+            ia = items_attn_dict.get(key)
+            if fa is not None and isinstance(fa, torch.Tensor) and ia is not None and isinstance(ia, torch.Tensor):
+                feat_layers.append(fa.float())
+                items_layers.append(ia.float())
 
-        if not layer_tensors:
+        if not feat_layers:
             return None
 
-        n_layers = len(layer_tensors)
-        n_blocks = layer_tensors[0].shape[1]
-        n_heads = layer_tensors[0].shape[3]
+        n_layers = len(feat_layers)
+        # Between-features: (batch_items=n_items, n_blocks, n_blocks, n_heads)
+        n_blocks = feat_layers[0].shape[1]
         n_feat_blocks = n_blocks - 1
         target_block = n_blocks - 1
+        # Between-items: (batch_blocks=n_blocks, n_items, n_items, n_heads)
+        n_items = items_layers[0].shape[1]
+        N = n_blocks * n_items
         mid_layer = n_layers // 2
 
-        device = layer_tensors[0].device
-        eye = torch.eye(n_blocks, device=device).unsqueeze(-1).expand(-1, -1, n_heads)
+        device = feat_layers[0].device
+        I_N = torch.eye(N, device=device)
 
-        rollout = eye.clone()
+        rollout = I_N.clone()
         rollout_mid = None
 
-        for li, at in enumerate(layer_tensors):
-            mean_at = at.mean(dim=0)  # (n_blocks, n_blocks, n_heads)
-            mixed = 0.5 * eye + 0.5 * mean_at
-            rollout = torch.einsum('abh,bch->ach', mixed, rollout)
+        for li in range(n_layers):
+            # Between-features: avg over batch_items and heads → (n_blocks, n_blocks)
+            feat_2d = torch.nan_to_num(feat_layers[li], nan=0.0).mean(dim=(0, -1))
+            # Between-items: avg over batch_blocks and heads → (n_items, n_items)
+            item_2d = torch.nan_to_num(items_layers[li], nan=0.0).mean(dim=(0, -1))
+
+            # Build N×N matrices via Kronecker products
+            # A_feat: block-diagonal — each item sees the same feature attention
+            # kron(I_items, feat_2d) would be block-diagonal
+            # But GRN uses kron(feat_attn_averaged_over_items, J_blocks) — let's match GRN exactly
+            # GRN: A_feat = kron(feat_2d, J_blocks) where feat_2d = (n_blocks, n_blocks)
+            #       since between_features operates per item, Kronecker with J broadcasts
+            # Actually the GRN treats: num_items = feat_attn.size(0) = n_blocks
+            #                           num_feature_blocks = item_attn.size(0) = n_items
+            # and N ordering = (block_b, item_i) → idx = block_b * n_items + item_i
+            # So kron(feat_2d(n_blocks,n_blocks), ones(n_items,n_items)) works.
+
+            J_items = torch.ones(n_items, n_items, device=device)
+            J_blocks = torch.ones(n_blocks, n_blocks, device=device)
+
+            A_feat = torch.kron(feat_2d, J_items)     # (N, N)
+            A_items = torch.kron(J_blocks, item_2d)    # (N, N)
+
+            # Add residual and normalize
+            A_feat = A_feat + I_N
+            A_feat = A_feat / (A_feat.sum(dim=-1, keepdim=True) + 1e-8)
+
+            A_items = A_items + I_N
+            A_items = A_items / (A_items.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # Sequential: items AFTER features
+            A_layer = A_items @ A_feat
+            rollout = A_layer @ rollout
 
             if li == mid_layer - 1:
-                rollout_mid = rollout[:n_feat_blocks, target_block, :].clone()
+                rollout_mid = self._extract_block_scores(
+                    rollout, n_blocks, n_items, n_feat_blocks, target_block
+                )
 
         if rollout_mid is None:
-            rollout_mid = rollout[:n_feat_blocks, target_block, :]
+            rollout_mid = self._extract_block_scores(
+                rollout, n_blocks, n_items, n_feat_blocks, target_block
+            )
+
+        # Extract final per-block scores
+        # For each feature block b, average rollout[b*n_items+i, target_block*n_items+j]
+        # over all items i and test positions j
+        rollout_final = self._extract_block_rollout_matrix(
+            rollout, n_blocks, n_items, n_feat_blocks
+        )
 
         return {
-            "rollout_final": rollout[:n_feat_blocks, :, :].cpu().numpy(),
-            "rollout_mid": rollout_mid.cpu().numpy(),
+            "rollout_final": rollout_final.cpu().numpy(),  # (n_feat_blocks, n_blocks, 1)
+            "rollout_mid": rollout_mid.cpu().numpy(),      # (n_feat_blocks, 1)
         }
+
+    @staticmethod
+    def _extract_block_scores(
+        rollout: torch.Tensor,
+        n_blocks: int,
+        n_items: int,
+        n_feat_blocks: int,
+        target_block: int,
+    ) -> torch.Tensor:
+        """Extract per-block to-target scores from N×N rollout matrix.
+
+        Returns: (n_feat_blocks, 1) — mean rollout from each feature block
+        to the target block, averaged over all item pairs.
+        """
+        scores = torch.zeros(n_feat_blocks, 1, device=rollout.device)
+        target_start = target_block * n_items
+        target_end = target_start + n_items
+
+        for b in range(n_feat_blocks):
+            src_start = b * n_items
+            src_end = src_start + n_items
+            # Average rollout from all items in block b to all items in target block
+            scores[b, 0] = rollout[src_start:src_end, target_start:target_end].mean()
+
+        return scores
+
+    @staticmethod
+    def _extract_block_rollout_matrix(
+        rollout: torch.Tensor,
+        n_blocks: int,
+        n_items: int,
+        n_feat_blocks: int,
+    ) -> torch.Tensor:
+        """Extract per-block-to-block rollout from N×N matrix.
+
+        Returns: (n_feat_blocks, n_blocks, 1) — mean rollout from each
+        source feature block to each destination block, averaged over items.
+        """
+        result = torch.zeros(n_feat_blocks, n_blocks, 1, device=rollout.device)
+        for src_b in range(n_feat_blocks):
+            src_start = src_b * n_items
+            src_end = src_start + n_items
+            for dst_b in range(n_blocks):
+                dst_start = dst_b * n_items
+                dst_end = dst_start + n_items
+                result[src_b, dst_b, 0] = rollout[src_start:src_end, dst_start:dst_end].mean()
+
+        return result

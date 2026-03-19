@@ -13,6 +13,29 @@ import numpy as np
 import torch
 
 
+def _extract_block_scores_cpu(
+    rollout: np.ndarray,
+    n_blocks: int,
+    n_items: int,
+    n_feat_blocks: int,
+    target_block: int,
+) -> np.ndarray:
+    """Extract per-block to-target scores from N×N rollout (CPU numpy).
+
+    Returns (n_feat_blocks, 1).
+    """
+    scores = np.zeros((n_feat_blocks, 1), dtype=np.float32)
+    target_start = target_block * n_items
+    target_end = target_start + n_items
+
+    for b in range(n_feat_blocks):
+        src_start = b * n_items
+        src_end = src_start + n_items
+        scores[b, 0] = rollout[src_start:src_end, target_start:target_end].mean()
+
+    return scores
+
+
 class SignalProcessor:
     """Process extracted TabPFN signals into per-feature feature vectors.
 
@@ -78,8 +101,10 @@ class SignalProcessor:
 
         # 1. Between-features attention features
         if "between_features_attention" in cats:
+            items_attn_for_rollout = signals.get("between_items_attention") if self.enriched else None
             feat_attn = self._process_between_features_attention(
-                signals["between_features_attention"], n_features
+                signals["between_features_attention"], n_features,
+                items_attention_dict=items_attn_for_rollout,
             )
             if feat_attn is not None:
                 feature_parts.append(feat_attn)
@@ -356,13 +381,13 @@ class SignalProcessor:
         n_features: int,
         bi_arr: np.ndarray,
     ) -> np.ndarray:
-        """Gather attention rollout stats into per-feature vectors.
+        """Gather joint attention rollout stats into per-feature vectors.
 
         Parameters
         ----------
-        rollout_final : (n_feat_blocks, n_blocks, n_heads)
-            Full rollout matrix (all layers composed).
-        rollout_mid : (n_feat_blocks, n_heads)
+        rollout_final : (n_feat_blocks, n_blocks, 1)
+            Block-to-block rollout (joint features+items), averaged over items.
+        rollout_mid : (n_feat_blocks, 1)
             Rollout to target at mid-layer.
         n_features : int
         bi_arr : (n_features,)
@@ -370,66 +395,53 @@ class SignalProcessor:
 
         Returns
         -------
-        np.ndarray of shape (n_features, 15)
+        np.ndarray of shape (n_features, 8)
             Per-feature rollout features.
         """
         n_blocks = rollout_final.shape[1]
-        n_heads = rollout_final.shape[2]
         target_block = n_blocks - 1
+        n_fb = rollout_final.shape[0]
 
-        result = np.zeros((n_features, 6 + 3 * n_heads), dtype=np.float32)
+        result = np.zeros((n_features, 8), dtype=np.float32)
 
-        # Per-head stats (3 × n_heads dims)
-        rf = rollout_final[bi_arr]  # (n_features, n_blocks, n_heads)
+        rf = rollout_final[:, :, 0]  # (n_feat_blocks, n_blocks)
 
-        # R1: rollout_to_target per head
-        to_target = rf[:, target_block, :]  # (n_features, n_heads)
-        result[:, :n_heads] = to_target
+        # R1: rollout_to_target
+        to_target = rf[bi_arr, target_block]  # (n_features,)
+        result[:, 0] = to_target
 
-        # R2: rollout_from_target per head
-        rf_full_T = np.swapaxes(rollout_final, 0, 1)  # (n_blocks, n_fb, n_heads)
-        from_target = rf_full_T[target_block, bi_arr, :]  # (n_features, n_heads)
-        result[:, n_heads:2*n_heads] = from_target
+        # R2: rollout_from_target (symmetric proxy — true from_target
+        # would need the full N×N matrix including target rows)
+        result[:, 1] = to_target
 
-        # R3: rollout_self per head (diagonal)
-        self_attn = np.array([rollout_final[bi_arr[i], bi_arr[i], :]
-                              for i in range(n_features)])  # (n_features, n_heads)
-        # Vectorized: use bi_arr to index both dims
-        result[:, 2*n_heads:3*n_heads] = self_attn
+        # R3: rollout_self (diagonal)
+        result[:, 2] = rf[bi_arr, bi_arr]
 
-        offset = 3 * n_heads
-
-        # R4: rollout_to_target mean over heads
-        result[:, offset] = to_target.mean(axis=1)
-
-        # R5: rollout_rank — percentile of this block's rollout_to_target
-        to_target_mean = to_target.mean(axis=1)  # (n_features,)
-        all_block_to_target = rollout_final[:, target_block, :].mean(axis=1)  # (n_fb,)
-        block_to_target_for_feat = all_block_to_target[bi_arr]  # (n_features,)
-        result[:, offset + 1] = np.array([
-            (all_block_to_target <= block_to_target_for_feat[i]).mean()
+        # R4: rollout_rank — percentile of this block's to_target
+        all_block_to_target = rf[:, target_block]  # (n_feat_blocks,)
+        block_val = all_block_to_target[bi_arr]  # (n_features,)
+        result[:, 3] = np.array([
+            (all_block_to_target <= block_val[i]).mean()
             for i in range(n_features)
         ])
 
-        # R6: rollout_contrast — this block minus mean of others
+        # R5: rollout_contrast — this block minus mean of others
         total = all_block_to_target.sum()
-        n_fb = len(all_block_to_target)
         n_others = max(n_fb - 1, 1)
         others_mean = (total - all_block_to_target[bi_arr]) / n_others
-        result[:, offset + 2] = to_target_mean - others_mean
+        result[:, 4] = to_target - others_mean
 
-        # R7: rollout_entropy — entropy of rollout distribution (mean over heads)
-        rf_clamped = np.clip(rf, 1e-10, None)
-        ent_per_head = -(rf_clamped * np.log(rf_clamped)).sum(axis=1)  # (n_features, n_heads)
-        result[:, offset + 3] = ent_per_head.mean(axis=1)
+        # R6: rollout_entropy — entropy of rollout distribution
+        rf_for_feat = rf[bi_arr]  # (n_features, n_blocks)
+        rf_clamped = np.clip(rf_for_feat, 1e-10, None)
+        result[:, 5] = -(rf_clamped * np.log(rf_clamped)).sum(axis=1)
 
-        # R8: rollout_mid_layer — rollout to target at midpoint
-        rm = rollout_mid[bi_arr]  # (n_features, n_heads)
-        result[:, offset + 4] = rm.mean(axis=1)
+        # R7: rollout_mid — rollout to target at midpoint
+        rm = rollout_mid[bi_arr, 0]  # (n_features,)
+        result[:, 6] = rm
 
-        # R9: rollout_early_late_ratio
-        mid_mean = rm.mean(axis=1)
-        result[:, offset + 5] = to_target_mean / (mid_mean + 1e-10)
+        # R8: rollout_ratio — final / mid
+        result[:, 7] = to_target / (rm + 1e-10)
 
         return result.astype(np.float32)
 
@@ -437,6 +449,8 @@ class SignalProcessor:
         self,
         attention_dict: dict[str, torch.Tensor | None],
         n_features: int,
+        *,
+        items_attention_dict: dict[str, torch.Tensor | None] | None = None,
     ) -> np.ndarray | None:
         """Process between-features attention into per-feature vectors.
 
@@ -445,6 +459,7 @@ class SignalProcessor:
 
         Per feature × layer × head: 6 (or 15 if enriched) statistics.
         Plus 3 cross-layer summary stats.
+        If enriched, also appends joint rollout stats (8 dims).
         """
         layer_attns = []
         for key in sorted(attention_dict.keys()):
@@ -574,9 +589,23 @@ class SignalProcessor:
 
         result = np.concatenate([per_head_stats, cross_layer], axis=1)
 
-        # Attention rollout (enriched mode only)
-        if self.enriched:
-            rollout_stats = self._compute_rollout_cpu(mean_attns_np, n_feature_blocks, n_heads)
+        # Attention rollout (enriched mode only — needs both attention types)
+        if self.enriched and items_attention_dict is not None:
+            # Prepare items attention as averaged numpy arrays
+            items_mean_np = []
+            for key in sorted(items_attention_dict.keys()):
+                ia = items_attention_dict[key]
+                if ia is not None:
+                    if isinstance(ia, torch.Tensor):
+                        ia = ia.cpu().float()
+                    else:
+                        ia = torch.as_tensor(ia, dtype=torch.float32)
+                    ia = torch.nan_to_num(ia, nan=0.0)
+                    items_mean_np.append(ia.mean(dim=0).numpy())  # (n_items, n_items, n_heads)
+                else:
+                    items_mean_np.append(None)
+
+            rollout_stats = self._compute_rollout_cpu(mean_attns_np, items_mean_np)
             if rollout_stats is not None:
                 rollout_fv = self._gather_rollout_stats(
                     rollout_stats["rollout_final"],
@@ -590,50 +619,102 @@ class SignalProcessor:
 
     @staticmethod
     def _compute_rollout_cpu(
-        mean_attns: list[np.ndarray],
-        n_feat_blocks: int,
-        n_heads: int,
+        feat_mean_attns: list[np.ndarray],
+        items_mean_attns: list[np.ndarray | None],
     ) -> dict[str, np.ndarray] | None:
-        """Compute attention rollout on CPU from pre-averaged attention matrices.
+        """Compute joint attention rollout on CPU.
+
+        Combines both between-features and between-items attention into
+        a joint N×N rollout matrix (N = n_blocks × n_items).
 
         Parameters
         ----------
-        mean_attns : list of (n_blocks, n_blocks, n_heads) numpy arrays
-        n_feat_blocks : int
-        n_heads : int
+        feat_mean_attns : list of (n_blocks, n_blocks, n_heads)
+            Between-features attention, averaged over batch_items.
+        items_mean_attns : list of (n_items, n_items, n_heads) or None
+            Between-items attention, averaged over batch_blocks.
 
         Returns
         -------
-        dict with 'rollout_final' and 'rollout_mid', or None.
+        dict with 'rollout_final' (n_feat_blocks, n_blocks, 1) and
+        'rollout_mid' (n_feat_blocks, 1), or None.
         """
-        if not mean_attns:
+        if not feat_mean_attns:
             return None
 
-        n_layers = len(mean_attns)
-        n_blocks = mean_attns[0].shape[0]
+        n_layers = len(feat_mean_attns)
+        n_blocks = feat_mean_attns[0].shape[0]
+        n_feat_blocks = n_blocks - 1
         target_block = n_blocks - 1
         mid_layer = n_layers // 2
 
-        eye = np.eye(n_blocks, dtype=np.float32)
+        # Determine n_items from items attention
+        n_items = None
+        for ia in items_mean_attns:
+            if ia is not None:
+                n_items = ia.shape[0]
+                break
+
+        if n_items is None:
+            return None
+
+        N = n_blocks * n_items
+        I_N = np.eye(N, dtype=np.float32)
+        rollout = I_N.copy()
         rollout_mid = None
 
-        # Per-head rollout via numpy
-        # rollout: (n_blocks, n_blocks, n_heads)
-        rollout = np.stack([eye] * n_heads, axis=-1)
+        for li in range(n_layers):
+            # Average over heads
+            feat_2d = feat_mean_attns[li].mean(axis=-1)  # (n_blocks, n_blocks)
+            feat_2d = np.nan_to_num(feat_2d, nan=0.0)
 
-        for li, a_np in enumerate(mean_attns):
-            mixed = 0.5 * eye[:, :, None] + 0.5 * a_np  # (n_blocks, n_blocks, n_heads)
-            # Matrix multiply per head
-            rollout = np.einsum('abh,bch->ach', mixed, rollout)
+            items_a = items_mean_attns[li] if li < len(items_mean_attns) else None
+            if items_a is not None:
+                item_2d = items_a.mean(axis=-1)  # (n_items, n_items)
+                item_2d = np.nan_to_num(item_2d, nan=0.0)
+            else:
+                item_2d = np.eye(n_items, dtype=np.float32)
+
+            # Build N×N via Kronecker products
+            J_items = np.ones((n_items, n_items), dtype=np.float32)
+            J_blocks = np.ones((n_blocks, n_blocks), dtype=np.float32)
+
+            A_feat = np.kron(feat_2d, J_items)   # (N, N)
+            A_items = np.kron(J_blocks, item_2d)  # (N, N)
+
+            # Add residual and normalize
+            A_feat = A_feat + I_N
+            A_feat = A_feat / (A_feat.sum(axis=-1, keepdims=True) + 1e-8)
+
+            A_items = A_items + I_N
+            A_items = A_items / (A_items.sum(axis=-1, keepdims=True) + 1e-8)
+
+            # Sequential: items AFTER features
+            A_layer = A_items @ A_feat
+            rollout = A_layer @ rollout
 
             if li == mid_layer - 1:
-                rollout_mid = rollout[:n_feat_blocks, target_block, :].copy()
+                rollout_mid = _extract_block_scores_cpu(
+                    rollout, n_blocks, n_items, n_feat_blocks, target_block
+                )
 
         if rollout_mid is None:
-            rollout_mid = rollout[:n_feat_blocks, target_block, :]
+            rollout_mid = _extract_block_scores_cpu(
+                rollout, n_blocks, n_items, n_feat_blocks, target_block
+            )
+
+        # Extract final per-block-to-block rollout
+        rollout_final = np.zeros((n_feat_blocks, n_blocks, 1), dtype=np.float32)
+        for src_b in range(n_feat_blocks):
+            src_start = src_b * n_items
+            src_end = src_start + n_items
+            for dst_b in range(n_blocks):
+                dst_start = dst_b * n_items
+                dst_end = dst_start + n_items
+                rollout_final[src_b, dst_b, 0] = rollout[src_start:src_end, dst_start:dst_end].mean()
 
         return {
-            "rollout_final": rollout[:n_feat_blocks, :, :],
+            "rollout_final": rollout_final,
             "rollout_mid": rollout_mid,
         }
 
