@@ -160,9 +160,9 @@ Per-feature-block scores are extracted by averaging over items: `score[block_b] 
 
 **Why joint rollout matters**: A features-only rollout ignores how information flows between samples (the in-context learning pathway). The joint rollout captures both: feature A may attend to feature B (between-features) while simultaneously, test samples attend to training samples with similar values (between-items). Only the joint composition reveals the true multi-hop information pathway through TabPFN's alternating attention architecture.
 
-**Verified**: Output matches GRN's `compute_sequential_attention_rollout()` to <1e-8 precision.
+**Verified**: Output matches GRN's `compute_sequential_attention_rollout()` to <1e-6 precision across 10 diverse configurations (varying n_items, n_blocks, n_heads, n_layers), plus edge cases (near-identity, all-uniform) and real TabPFN extraction.
 
-**Why this matters**: `to_target` and `from_target` directly measure the feature↔target information flow. If TabPFN has learned that feature f3 is causal, the attention from block_1 (containing f3) to the target block should be high. The enriched stats add **relational context**: `contrast_to_target` measures how much a block *preferentially* attends to the target (vs spreading attention everywhere), and `mean_asymmetry` captures whether the feature→target relationship is directional. The `linear_trend` captures whether this attention increases through deeper layers.
+**Why the basic feature stats matter**: `to_target` and `from_target` directly measure the feature↔target information flow. If TabPFN has learned that feature f3 is causal, the attention from block_1 (containing f3) to the target block should be high. The enriched stats add **relational context**: `contrast_to_target` measures how much a block *preferentially* attends to the target (vs spreading attention everywhere), and `mean_asymmetry` captures whether the feature→target relationship is directional. The `linear_trend` captures whether this attention increases through deeper layers.
 
 ### 2.2 Between-Items Attention — INDIRECT SIGNAL
 
@@ -302,7 +302,11 @@ This category is **not available** in `input_only` mode (v6 default).
 
 ## 3. Summary: Dimension Counts
 
-### enriched=False (v6 default, 1267 dims)
+There are two processing paths: the **CPU path** (full enriched stats) and the **GPU path** (basic per-layer stats + GPU-only rollout). The v6 data pipeline uses the GPU path for speed.
+
+### enriched=False (v6 default)
+
+Both paths produce the same dimensions:
 
 ```
 Category                  Dims    Per-Feature?   Quality
@@ -317,24 +321,43 @@ MLP activations             90    Per-block (3)   ★★★☆☆  (indirect)
 TOTAL                    1267    Effective: ~583
 ```
 
-### enriched=True (with joint rollout)
+### enriched=True — GPU path (1275 dims)
+
+The GPU path (`GPUStatsComputer` → `process_from_stats`) computes **basic** per-layer stats on GPU, plus the **joint rollout** which requires GPU for efficient N×N matmul:
 
 ```
-Category                  Dims    Per-Feature?   Quality
+Category                  Dims    Notes
 ─────────────────────────────────────────────────────────
-Between-features attn      821    Per-block (3)   ★★★★★  (+asymmetry, ranking, contrast, JOINT ROLLOUT)
-Between-items attn         486    Per-block (3)   ★★★☆☆  (+train/test split awareness)
-Embeddings                 576    NO (identical)  ☆☆☆☆☆  (still useless)
-Input gradients              8    YES (per-feat)  ★★★★★  (+rank, contrast, energy)
-Attention gradients        327    ZERO (all 0)*   ☆☆☆☆☆  (*input_only mode → zeros)
-MLP activations            183    Per-block (3)   ★★★★☆  (+cosine_to_target, skewness)
+Between-features attn      327    6 stats × 18L × 3H + 3 (basic stats)
+  + Joint rollout            8    8 rollout features (GPU-computed)
+Between-items attn         162    3 stats × 18L × 3H (basic stats)
+Embeddings                 576    3 × 192 (tiled, useless)
+Input gradients              4    4 basic per-feature stats
+Attention gradients        108    ZERO (all 0 in input_only)
+MLP activations             90    5 stats × 18L (basic)
 ─────────────────────────────────────────────────────────
-TOTAL (no items_attn_grad) 2401†  Effective: ~1498†
+TOTAL                    1275    Effective: ~591 + 8 rollout
 ```
 
-† With `extract_gradients=True` (full mode), items_attention_gradients adds 324 dims.
+### enriched=True — CPU path (2401 dims)
 
-### enriched=True + extract_gradients=True (full extraction)
+The CPU path (`process()`) computes all enriched per-layer stats:
+
+```
+Category                  Dims    Notes
+─────────────────────────────────────────────────────────
+Between-features attn      813    15 stats × 18L × 3H + 3
+  + Joint rollout            8    8 rollout features (CPU Kronecker)
+Between-items attn         486    9 stats × 18L × 3H
+Embeddings                 576    3 × 192 (tiled, useless)
+Input gradients              8    8 enriched per-feature stats
+Attention gradients        327    6 stats × 18L × 3H + 3 (ZERO in input_only)
+MLP activations            183    10 stats × 18L + 3
+─────────────────────────────────────────────────────────
+TOTAL                    2401    Effective: ~1498
+```
+
+### enriched=True + extract_gradients=True (full extraction, CPU path)
 
 ```
 Category                  Dims    Notes
@@ -347,8 +370,8 @@ Attention gradients        327    6 stats × 18L × 3H + 3
 Items attention gradients  324    6 stats × 18L × 3H
 MLP activations            183    10 stats × 18L + 3
 ─────────────────────────────────────────────────────────
-TOTAL                    2732
-Effective (excl emb):    2156
+TOTAL                    2725
+Effective (excl emb):    2149
 ```
 
 ## 4. Implications and Possible Improvements
@@ -370,6 +393,16 @@ Switch from `enriched=False` (3 stats) to `enriched=True` (9 stats) for between-
 ### D. Extract Per-Feature Attention (requires model changes)
 Instead of block-level stats, extract **element-wise attention within blocks** — e.g., the attention from each of the 3 features in a block to the target, using the raw Q·K computation before the block-level projection. This would require modifying the encoder to expose sub-block information.
 
+### E. Joint Attention Rollout (✅ IMPLEMENTED)
+Combines both between-features and between-items attention into a unified N×N rollout matrix via Kronecker products. Captures cumulative multi-hop information flow through TabPFN's alternating attention architecture.
+
+**Implementation details**:
+- GPU path: `GPUStatsComputer._compute_rollout()` — builds N×N via `torch.kron`, composes across 18 layers
+- CPU path: `SignalProcessor._compute_rollout_cpu()` — equivalent numpy implementation
+- Adds 8 per-feature dims: rollout_to_target, from_target (symmetric proxy), self, rank, contrast, entropy, mid, ratio
+- Verified identical to GRN's `compute_sequential_attention_rollout()` to <1e-6 across 10 configurations
+- Overhead: ~8ms on GPU for N=912 (negligible)
+
 ## 5. Code References
 
 | Component | File | Key Lines |
@@ -382,7 +415,12 @@ Instead of block-level stats, extract **element-wise attention within blocks** �
 | Attention weight computation | `src/tabpfn/architectures/base/attention/full_attention.py` | 657–798 |
 | Attention weight caching | `src/tabpfn/architectures/base/attention/full_attention.py` | 564–571 |
 | Signal extraction (hooks + collection) | `src/tabpfn/interpretation/extraction/signal_extractor.py` | 54–407 |
-| Between-features stats processing | `src/tabpfn/interpretation/extraction/signal_processor.py` | 340–478 |
-| Between-items stats processing | `src/tabpfn/interpretation/extraction/signal_processor.py` | 480–555 |
-| GPU stats computation | `src/tabpfn/interpretation/extraction/gpu_stats_computer.py` | full file |
+| Between-features stats (CPU, enriched) | `src/tabpfn/interpretation/extraction/signal_processor.py` | 448–595 |
+| Between-items stats (CPU, enriched) | `src/tabpfn/interpretation/extraction/signal_processor.py` | 721+ |
+| Joint rollout stats gathering | `src/tabpfn/interpretation/extraction/signal_processor.py` | 377–434 |
+| Joint rollout CPU computation | `src/tabpfn/interpretation/extraction/signal_processor.py` | 621–710 |
+| GPU stats computation | `src/tabpfn/interpretation/extraction/gpu_stats_computer.py` | 32–290 |
+| Joint rollout GPU computation | `src/tabpfn/interpretation/extraction/gpu_stats_computer.py` | 293–440 |
+| GRN sequential rollout (reference impl) | `src/tabpfn/grn/attention_extractor.py` | 584–665 |
+| GRN Kronecker helpers | `src/tabpfn/grn/attention_extractor.py` | 387–464 |
 | NormalizeFeatureGroups encoder step | `src/tabpfn/architectures/encoders/steps/normalize_feature_groups_encoder_step.py` | full file |
