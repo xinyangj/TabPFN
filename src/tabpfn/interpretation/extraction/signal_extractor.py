@@ -112,6 +112,12 @@ class SignalExtractor:
             encoder_layers, value_contributions
         )
 
+        # Register hook for initial token embeddings (before transformer layers)
+        token_embeddings: list[torch.Tensor] = []
+        token_hook = self._register_token_embedding_hook(
+            architecture, token_embeddings
+        )
+
         try:
             # Prepare input data
             X_combined, y_combined, single_eval_pos = self._prepare_inputs(
@@ -192,6 +198,10 @@ class SignalExtractor:
                     # We don't have hidden states without hooks, so skip
                     pass
 
+            # Collect initial token embeddings (per-block, before transformer)
+            if token_embeddings:
+                signals["token_embeddings"] = token_embeddings[0]
+
             signals["n_features"] = X_train.shape[1]
             signals["n_train"] = X_train.shape[0]
             signals["n_test"] = X_test.shape[0]
@@ -206,6 +216,8 @@ class SignalExtractor:
                 hook.remove()
             for hook in value_hooks:
                 hook.remove()
+            if token_hook is not None:
+                token_hook.remove()
             self._disable_attention_extraction(encoder_layers)
 
     def _get_architecture(self, model: Any) -> nn.Module:
@@ -258,6 +270,38 @@ class SignalExtractor:
 
             hooks.append(layer.mlp.register_forward_hook(hook_fn))
         return hooks
+
+    def _register_token_embedding_hook(
+        self,
+        architecture: nn.Module,
+        storage: list[torch.Tensor],
+    ) -> torch.utils.hooks.RemovableHook | None:
+        """Register a forward hook to capture initial token embeddings.
+
+        Captures ``embedded_input`` (before transformer layers) which has shape
+        ``(batch, n_items, n_blocks, emsize)``. Extracts feature blocks only
+        (excludes target block at index -1).
+        """
+        encoder = getattr(architecture, "transformer_encoder", None)
+        if encoder is None:
+            return None
+
+        def hook_fn(
+            module: nn.Module,
+            inp: tuple[torch.Tensor, ...],
+            output: torch.Tensor,
+        ) -> None:
+            x = inp[0]  # (batch, n_items, n_blocks, emsize)
+            # Feature blocks are all except the last (target) block
+            if x.dim() == 4:
+                feat_emb = x[:, :, :-1, :].detach().clone()
+                # Flatten batch dim: (batch*n_items, n_feat_blocks, emsize)
+                feat_emb = feat_emb.reshape(-1, feat_emb.shape[-2], feat_emb.shape[-1])
+            else:
+                feat_emb = x[:, :-1, :].detach().clone()
+            storage.append(feat_emb)
+
+        return encoder.register_forward_hook(hook_fn)
 
     def _register_value_contribution_hooks(
         self,

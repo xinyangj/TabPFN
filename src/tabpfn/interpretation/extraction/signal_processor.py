@@ -227,9 +227,15 @@ class SignalProcessor:
             if fv is not None:
                 feature_parts.append(fv)
 
-        # 3. Embedding features
+        # 3. Embedding features (per-block token embeddings or global fallback)
         if "embeddings" in cats:
-            emb_feats = self._process_embeddings(gpu_stats, n_features)
+            if "token_embedding_stats" in gpu_stats:
+                emb_feats = self._gather_token_embedding_stats(
+                    gpu_stats["token_embedding_stats"], n_features
+                )
+            else:
+                # Fallback to old global embeddings
+                emb_feats = self._process_embeddings(gpu_stats, n_features)
             if emb_feats is not None:
                 feature_parts.append(emb_feats)
 
@@ -578,6 +584,30 @@ class SignalProcessor:
             return None
 
         return np.concatenate(parts, axis=1).astype(np.float32)
+
+    def _gather_token_embedding_stats(
+        self,
+        token_stats: np.ndarray,
+        n_features: int,
+    ) -> np.ndarray | None:
+        """Gather per-block token embedding stats into per-feature vectors.
+
+        Parameters
+        ----------
+        token_stats : (n_feat_blocks, 576)
+            Per-block: test_mean(192) + test_std(192) + train_mean(192).
+        n_features : int
+
+        Returns
+        -------
+        np.ndarray of shape (n_features, 576)
+        """
+        n_feat_blocks = token_stats.shape[0]
+        bi_arr = np.array([
+            min(i * n_feat_blocks // n_features, n_feat_blocks - 1)
+            for i in range(n_features)
+        ])
+        return token_stats[bi_arr, :].astype(np.float32)
 
     def _gather_value_contribution_stats(
         self,

@@ -74,10 +74,23 @@ class GPUStatsComputer:
                     result["mlp_cross_layer"] = mlp_result["cross_layer"]
 
         # Small tensors: transfer directly to CPU
-        for key in ("train_embeddings", "test_embeddings", "input_gradients"):
+        for key in ("input_gradients",):
             val = signals.get(key)
             if val is not None and isinstance(val, torch.Tensor):
                 result[key] = val.detach().cpu().float()
+
+        # Token embeddings: compute per-block stats on GPU
+        token_emb = signals.get("token_embeddings")
+        if token_emb is not None and isinstance(token_emb, torch.Tensor):
+            te_stats = self._compute_token_embedding_stats(token_emb, n_train=n_train)
+            if te_stats is not None:
+                result["token_embedding_stats"] = te_stats
+        else:
+            # Fallback: old-style global embeddings (backward compatibility)
+            for key in ("train_embeddings", "test_embeddings"):
+                val = signals.get(key)
+                if val is not None and isinstance(val, torch.Tensor):
+                    result[key] = val.detach().cpu().float()
 
         # Attention gradients (small: between-features shape)
         attn_grads = signals.get("attention_gradients")
@@ -715,3 +728,43 @@ class GPUStatsComputer:
         attr = attr / n_items
 
         return attr.cpu().numpy()
+
+    @torch.no_grad()
+    def _compute_token_embedding_stats(
+        self,
+        token_embeddings: torch.Tensor,
+        *,
+        n_train: int = 0,
+    ) -> np.ndarray | None:
+        """Compute per-block embedding statistics on GPU.
+
+        Parameters
+        ----------
+        token_embeddings : (n_items, n_feat_blocks, emsize)
+            Initial per-block token embeddings before transformer layers.
+        n_train : int
+            Number of training items (for train/test split).
+
+        Returns
+        -------
+        np.ndarray of shape (n_feat_blocks, 576)
+            Per-block: test_mean(192) + test_std(192) + train_mean(192).
+        """
+        emb = token_embeddings.float()
+        n_items = emb.shape[0]
+
+        if n_train > 0 and n_train < n_items:
+            train_emb = emb[:n_train]  # (n_train, n_feat_blocks, emsize)
+            test_emb = emb[n_train:]  # (n_test, n_feat_blocks, emsize)
+        else:
+            train_emb = emb
+            test_emb = emb
+
+        # Per-block stats: (n_feat_blocks, emsize) each
+        test_mean = test_emb.mean(dim=0)
+        test_std = test_emb.std(dim=0).nan_to_num(0.0)
+        train_mean = train_emb.mean(dim=0)
+
+        # Concatenate: (n_feat_blocks, 3*emsize=576)
+        stats = torch.cat([test_mean, test_std, train_mean], dim=-1)
+        return stats.cpu().numpy()
