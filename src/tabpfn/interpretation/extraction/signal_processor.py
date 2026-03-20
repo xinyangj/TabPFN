@@ -847,10 +847,11 @@ class SignalProcessor:
         feat_mean_attns: list[np.ndarray],
         items_mean_attns: list[np.ndarray | None],
     ) -> dict[str, np.ndarray] | None:
-        """Compute joint attention rollout on CPU.
+        """Compute attention rollout on CPU (block-level approximation).
 
-        Combines both between-features and between-items attention into
-        a joint N×N rollout matrix (N = n_blocks × n_items).
+        Uses block-level (n_blocks × n_blocks) matrices instead of full
+        N×N to avoid O(n_items²·n_blocks²) memory/compute. Items attention
+        is incorporated as a scalar diagonal mixing weight.
 
         Parameters
         ----------
@@ -873,19 +874,8 @@ class SignalProcessor:
         target_block = n_blocks - 1
         mid_layer = n_layers // 2
 
-        # Determine n_items from items attention
-        n_items = None
-        for ia in items_mean_attns:
-            if ia is not None:
-                n_items = ia.shape[0]
-                break
-
-        if n_items is None:
-            return None
-
-        N = n_blocks * n_items
-        I_N = np.eye(N, dtype=np.float32)
-        rollout = I_N.copy()
+        I_B = np.eye(n_blocks, dtype=np.float32)
+        rollout = I_B.copy()
         rollout_mid = None
 
         for li in range(n_layers):
@@ -893,50 +883,28 @@ class SignalProcessor:
             feat_2d = feat_mean_attns[li].mean(axis=-1)  # (n_blocks, n_blocks)
             feat_2d = np.nan_to_num(feat_2d, nan=0.0)
 
+            # Items attention: scalar diagonal self-attention strength
+            item_mix = 0.0
             items_a = items_mean_attns[li] if li < len(items_mean_attns) else None
             if items_a is not None:
-                item_2d = items_a.mean(axis=-1)  # (n_items, n_items)
+                item_2d = items_a.mean(axis=-1)
                 item_2d = np.nan_to_num(item_2d, nan=0.0)
-            else:
-                item_2d = np.eye(n_items, dtype=np.float32)
+                item_mix = float(np.diag(item_2d).mean())
 
-            # Build N×N via Kronecker products
-            J_items = np.ones((n_items, n_items), dtype=np.float32)
-            J_blocks = np.ones((n_blocks, n_blocks), dtype=np.float32)
+            # Block-level attention with items as diagonal boost + residual
+            A = feat_2d + item_mix * I_B + I_B
+            A = A / (A.sum(axis=-1, keepdims=True) + 1e-8)
 
-            A_feat = np.kron(feat_2d, J_items)   # (N, N)
-            A_items = np.kron(J_blocks, item_2d)  # (N, N)
-
-            # Add residual and normalize
-            A_feat = A_feat + I_N
-            A_feat = A_feat / (A_feat.sum(axis=-1, keepdims=True) + 1e-8)
-
-            A_items = A_items + I_N
-            A_items = A_items / (A_items.sum(axis=-1, keepdims=True) + 1e-8)
-
-            # Sequential: items AFTER features
-            A_layer = A_items @ A_feat
-            rollout = A_layer @ rollout
+            rollout = A @ rollout
 
             if li == mid_layer - 1:
-                rollout_mid = _extract_block_scores_cpu(
-                    rollout, n_blocks, n_items, n_feat_blocks, target_block
-                )
+                rollout_mid = rollout[:n_feat_blocks, target_block:target_block+1].copy()
 
         if rollout_mid is None:
-            rollout_mid = _extract_block_scores_cpu(
-                rollout, n_blocks, n_items, n_feat_blocks, target_block
-            )
+            rollout_mid = rollout[:n_feat_blocks, target_block:target_block+1].copy()
 
-        # Extract final per-block-to-block rollout
-        rollout_final = np.zeros((n_feat_blocks, n_blocks, 1), dtype=np.float32)
-        for src_b in range(n_feat_blocks):
-            src_start = src_b * n_items
-            src_end = src_start + n_items
-            for dst_b in range(n_blocks):
-                dst_start = dst_b * n_items
-                dst_end = dst_start + n_items
-                rollout_final[src_b, dst_b, 0] = rollout[src_start:src_end, dst_start:dst_end].mean()
+        # Extract block-to-block rollout
+        rollout_final = rollout[:n_feat_blocks, :, np.newaxis].copy()
 
         return {
             "rollout_final": rollout_final,
