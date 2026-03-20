@@ -188,6 +188,7 @@ class SignalProcessor:
             "embeddings",
             "gradients",
             "mlp_activations",
+            "value_contributions",
         }
         cats = signal_categories if signal_categories is not None else all_cats
 
@@ -254,6 +255,18 @@ class SignalProcessor:
                 gpu_stats["hidden_grad_block_stats"],
                 gpu_stats.get("hidden_grad_raw_key"),
                 gpu_stats.get("hidden_grad_raw_avg"),
+                n_features,
+            )
+            if fv is not None:
+                feature_parts.append(fv)
+
+        # 7. Value contribution features (enriched mode only)
+        if self.enriched and "value_contributions" in cats and "value_contrib_block_stats" in gpu_stats:
+            fv = self._gather_value_contribution_stats(
+                gpu_stats["value_contrib_block_stats"],
+                gpu_stats.get("value_contrib_raw_key"),
+                gpu_stats.get("value_contrib_raw_avg"),
+                gpu_stats.get("logit_attribution"),
                 n_features,
             )
             if fv is not None:
@@ -560,6 +573,67 @@ class SignalProcessor:
         if raw_avg is not None:
             gathered_avg = raw_avg[bi_arr, :]  # (n_features, emsize)
             parts.append(gathered_avg)
+
+        if not parts:
+            return None
+
+        return np.concatenate(parts, axis=1).astype(np.float32)
+
+    def _gather_value_contribution_stats(
+        self,
+        block_stats: np.ndarray,
+        raw_key: np.ndarray | None,
+        raw_avg: np.ndarray | None,
+        logit_attribution: np.ndarray | None,
+        n_features: int,
+    ) -> np.ndarray | None:
+        """Gather attention value contribution features into per-feature vectors.
+
+        Parameters
+        ----------
+        block_stats : (n_layers, n_feat_blocks, 6)
+            Per-layer per-block contribution statistics.
+        raw_key : (3, n_feat_blocks, emsize) or None
+            Raw contribution vectors for 3 key layers (first, mid, last).
+        raw_avg : (n_feat_blocks, emsize) or None
+            Layer-averaged raw contribution vector.
+        logit_attribution : (n_layers, n_feat_blocks) or None
+            Signed scalar logit attribution per layer per block.
+        n_features : int
+
+        Returns
+        -------
+        np.ndarray of shape (n_features, D)
+            D = n_layers*6 + 3*emsize + emsize + n_layers = 108 + 576 + 192 + 18 = 894
+        """
+        n_feat_blocks = block_stats.shape[1]
+        bi_arr = np.array([
+            min(i * n_feat_blocks // n_features, n_feat_blocks - 1)
+            for i in range(n_features)
+        ])
+
+        parts = []
+
+        # 1. Per-layer stats: (n_layers, n_feat_blocks, 6) → (n_features, n_layers*6)
+        gathered_stats = block_stats[:, bi_arr, :]
+        stats_flat = gathered_stats.transpose(1, 0, 2).reshape(n_features, -1)
+        parts.append(stats_flat)
+
+        # 2. Raw key layers: (3, n_feat_blocks, emsize) → (n_features, 3*emsize)
+        if raw_key is not None:
+            gathered_key = raw_key[:, bi_arr, :]
+            key_flat = gathered_key.transpose(1, 0, 2).reshape(n_features, -1)
+            parts.append(key_flat)
+
+        # 3. Raw average: (n_feat_blocks, emsize) → (n_features, emsize)
+        if raw_avg is not None:
+            gathered_avg = raw_avg[bi_arr, :]
+            parts.append(gathered_avg)
+
+        # 4. Logit attribution scalars: (n_layers, n_feat_blocks) → (n_features, n_layers)
+        if logit_attribution is not None:
+            gathered_logit = logit_attribution[:, bi_arr]  # (n_layers, n_features)
+            parts.append(gathered_logit.T)  # (n_features, n_layers)
 
         if not parts:
             return None

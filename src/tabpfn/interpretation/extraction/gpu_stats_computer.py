@@ -105,6 +105,23 @@ class GPUStatsComputer:
                 if hg_result is not None:
                     result.update(hg_result)
 
+        # Value contributions (enriched mode only)
+        if self.enriched:
+            val_contribs = signals.get("value_contributions")
+            if val_contribs and isinstance(val_contribs, dict):
+                vc_result = self._compute_value_contribution_stats(val_contribs)
+                if vc_result is not None:
+                    result.update(vc_result)
+
+                # Logit attribution scalars (needs decoder Jacobian)
+                dec_jac = signals.get("decoder_jacobian")
+                if dec_jac is not None:
+                    logit_attr = self._compute_logit_attribution(
+                        val_contribs, dec_jac
+                    )
+                    if logit_attr is not None:
+                        result["logit_attribution"] = logit_attr
+
         return result
 
     def _compute_items_attention_stats(
@@ -621,3 +638,80 @@ class GPUStatsComputer:
             "hidden_grad_raw_key": raw_key.cpu().numpy(),
             "hidden_grad_raw_avg": raw_avg.cpu().numpy(),
         }
+
+    def _compute_value_contribution_stats(
+        self,
+        contributions: dict[int, torch.Tensor],
+    ) -> dict[str, np.ndarray] | None:
+        """Compute per-block stats for attention value contributions on GPU.
+
+        Each contribution tensor has shape ``(n_items, n_feat_blocks, emsize)``.
+        Returns stats, raw key layers, and raw layer average — same structure
+        as hidden state gradient stats.
+        """
+        sorted_keys = sorted(contributions.keys())
+        n_layers = len(sorted_keys)
+        if n_layers == 0:
+            return None
+
+        # Stack: (L, n_items, n_feat_blocks, emsize)
+        stacked = torch.stack([contributions[k].float() for k in sorted_keys])
+        # Mean over items → (L, n_feat_blocks, emsize)
+        feat_contribs = stacked.mean(dim=1)
+        n_feat_blocks = feat_contribs.shape[1]
+        device = feat_contribs.device
+
+        # Per-layer stats: 6 per layer per block
+        n_stats = 6
+        block_stats = torch.zeros(n_layers, n_feat_blocks, n_stats, device=device)
+        block_stats[:, :, 0] = feat_contribs.norm(dim=2)
+        block_stats[:, :, 1] = feat_contribs.mean(dim=2)
+        block_stats[:, :, 2] = feat_contribs.abs().max(dim=2).values
+        block_stats[:, :, 3] = feat_contribs.std(dim=2)
+        block_stats[:, :, 4] = (feat_contribs > 0).float().mean(dim=2)
+        block_stats[:, :, 5] = (feat_contribs.abs() < 0.01).float().mean(dim=2)
+
+        # Raw contributions at 3 key layers
+        mid = n_layers // 2
+        last = n_layers - 1
+        raw_key = feat_contribs[[0, mid, last]]  # (3, nfb, emsize)
+        raw_avg = feat_contribs.mean(dim=0)  # (nfb, emsize)
+
+        return {
+            "value_contrib_block_stats": block_stats.cpu().numpy(),
+            "value_contrib_raw_key": raw_key.cpu().numpy(),
+            "value_contrib_raw_avg": raw_avg.cpu().numpy(),
+        }
+
+    def _compute_logit_attribution(
+        self,
+        contributions: dict[int, torch.Tensor],
+        decoder_jacobian: torch.Tensor,
+    ) -> np.ndarray | None:
+        """Compute per-layer logit attribution scalars.
+
+        Projects each layer's per-block value contribution through the decoder
+        Jacobian to get a signed scalar measuring how much each block's
+        contribution at each layer affects the prediction.
+
+        Returns shape ``(n_layers, n_feat_blocks)``.
+        """
+        sorted_keys = sorted(contributions.keys())
+        n_layers = len(sorted_keys)
+        if n_layers == 0:
+            return None
+
+        # Stack: (L, n_items, n_feat_blocks, emsize)
+        stacked = torch.stack([contributions[k].float() for k in sorted_keys])
+        # decoder_jacobian: (n_items, emsize)
+        J = decoder_jacobian.float()
+
+        # Dot product: J[i] · contrib[l, i, b] → scalar per layer, item, block
+        # Then mean over items → (L, n_feat_blocks)
+        # J shape: (n_items, emsize) → (1, n_items, 1, emsize)
+        attr = torch.einsum("ie, life -> lf", J, stacked)  # sum over items and emsize
+        # Normalize by n_items
+        n_items = stacked.shape[1]
+        attr = attr / n_items
+
+        return attr.cpu().numpy()

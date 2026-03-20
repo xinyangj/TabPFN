@@ -106,6 +106,12 @@ class SignalExtractor:
                 encoder_layers, hidden_states
             )
 
+        # Register hooks for attention value contributions
+        value_contributions: dict[int, torch.Tensor] = {}
+        value_hooks = self._register_value_contribution_hooks(
+            encoder_layers, value_contributions
+        )
+
         try:
             # Prepare input data
             X_combined, y_combined, single_eval_pos = self._prepare_inputs(
@@ -156,6 +162,36 @@ class SignalExtractor:
                 if hidden_grads:
                     signals["hidden_state_gradients"] = hidden_grads
 
+            # Collect attention value contributions
+            if value_contributions:
+                signals["value_contributions"] = {
+                    k: v.clone() for k, v in value_contributions.items()
+                }
+
+                # Compute decoder Jacobian for logit attribution (Phase 2)
+                # Use final hidden state for target block to compute
+                # d(decoder_output.mean())/d(h_final)
+                if hidden_states:
+                    last_layer = max(hidden_states.keys())
+                    h_final_full = hidden_states[last_layer].detach()
+                    # h_final_full shape: (batch, n_items, n_blocks, emsize)
+                    if h_final_full.dim() == 4:
+                        h_target = h_final_full[:, :, -1, :]  # target block
+                        h_target = h_target.reshape(-1, h_target.shape[-1])
+                    else:
+                        h_target = h_final_full[:, -1, :]
+                    h_target = h_target.detach().requires_grad_(True)
+                    decoder = architecture.decoder_dict["standard"]
+                    logits = decoder(h_target)
+                    j_loss = logits.mean(dim=-1).sum()
+                    j_grad = torch.autograd.grad(j_loss, h_target)[0]
+                    signals["decoder_jacobian"] = j_grad.detach()
+                elif self.extract_gradients is False:
+                    # No backward pass available, but we can still compute
+                    # the Jacobian by doing a fresh forward through decoder
+                    # We don't have hidden states without hooks, so skip
+                    pass
+
             signals["n_features"] = X_train.shape[1]
             signals["n_train"] = X_train.shape[0]
             signals["n_test"] = X_test.shape[0]
@@ -167,6 +203,8 @@ class SignalExtractor:
             for hook in hooks:
                 hook.remove()
             for hook in hidden_hooks:
+                hook.remove()
+            for hook in value_hooks:
                 hook.remove()
             self._disable_attention_extraction(encoder_layers)
 
@@ -219,6 +257,59 @@ class SignalExtractor:
                 storage[layer_idx] = output.detach()
 
             hooks.append(layer.mlp.register_forward_hook(hook_fn))
+        return hooks
+
+    def _register_value_contribution_hooks(
+        self,
+        layers: list[nn.Module],
+        storage: dict[int, torch.Tensor],
+    ) -> list[torch.utils.hooks.RemovableHook]:
+        """Register forward hooks to capture attention value contributions.
+
+        For each layer's between-features attention, computes the per-block
+        contribution to the target block: ``c_i = Σ_h α[target,i,h] · V_i[h] · W_out[h]``.
+        This is the linear decomposition of the attention output w.r.t. input
+        token representations.
+
+        Requires ``enable_attention_weights_return(True)`` to be set on the
+        attention modules before the forward pass.
+        """
+        hooks = []
+        for i, layer in enumerate(layers):
+            fa = layer.self_attn_between_features
+            if fa is None:
+                continue
+
+            def hook_fn(
+                module: nn.Module,
+                inp: tuple[torch.Tensor, ...],
+                output: torch.Tensor,
+                layer_idx: int = i,
+                attn_module: nn.Module = fa,
+            ) -> None:
+                alpha = attn_module.get_attention_weights()
+                if alpha is None:
+                    return
+                x = inp[0]
+                # Flatten to (batch*items, n_blocks, emsize) if 4D
+                if x.dim() == 4:
+                    x = x.reshape(-1, x.shape[-2], x.shape[-1])
+                # V = x @ w_v^T per head; w_qkv[2] = w_v
+                w_v = attn_module._w_qkv[2]  # (nhead, d_v, emsize)
+                V = torch.einsum("b k s, h d s -> b k h d", x, w_v)
+                n_blocks = alpha.shape[2]
+                target = n_blocks - 1
+                n_feat = target
+                # Attention weights from target block to each feature block
+                alpha_t = alpha[:, target, :n_feat, :]  # (bi, n_feat, nhead)
+                V_feat = V[:, :n_feat, :, :]  # (bi, n_feat, nhead, d_v)
+                weighted_v = alpha_t.unsqueeze(-1) * V_feat
+                contrib = torch.einsum(
+                    "b k h d, h d s -> b k s", weighted_v, attn_module._w_out
+                )
+                storage[layer_idx] = contrib.detach()
+
+            hooks.append(fa.register_forward_hook(hook_fn))
         return hooks
 
     def _register_hidden_state_hooks(
