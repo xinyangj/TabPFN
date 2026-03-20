@@ -248,6 +248,17 @@ class SignalProcessor:
             if fv is not None:
                 feature_parts.append(fv)
 
+        # 6. Hidden state gradient features (enriched mode only)
+        if self.enriched and "gradients" in cats and "hidden_grad_block_stats" in gpu_stats:
+            fv = self._gather_hidden_grad_stats(
+                gpu_stats["hidden_grad_block_stats"],
+                gpu_stats.get("hidden_grad_raw_key"),
+                gpu_stats.get("hidden_grad_raw_avg"),
+                n_features,
+            )
+            if fv is not None:
+                feature_parts.append(fv)
+
         if not feature_parts:
             raise ValueError("No stats could be processed.")
 
@@ -500,6 +511,60 @@ class SignalProcessor:
         result[:, 7] = to_target / (rm + 1e-10)
 
         return result.astype(np.float32)
+
+    def _gather_hidden_grad_stats(
+        self,
+        block_stats: np.ndarray,
+        raw_key: np.ndarray | None,
+        raw_avg: np.ndarray | None,
+        n_features: int,
+    ) -> np.ndarray | None:
+        """Gather hidden state gradient features into per-feature vectors.
+
+        Parameters
+        ----------
+        block_stats : (n_layers, n_feat_blocks, 6)
+            Per-layer per-block gradient statistics.
+        raw_key : (3, n_feat_blocks, emsize) or None
+            Raw gradient vectors for 3 key layers (first, mid, last).
+        raw_avg : (n_feat_blocks, emsize) or None
+            Layer-averaged raw gradient vector.
+        n_features : int
+
+        Returns
+        -------
+        np.ndarray of shape (n_features, D)
+            D = n_layers * 6 + 3 * emsize + emsize = 108 + 576 + 192 = 876
+        """
+        n_feat_blocks = block_stats.shape[1]
+        bi_arr = np.array([
+            min(i * n_feat_blocks // n_features, n_feat_blocks - 1)
+            for i in range(n_features)
+        ])
+
+        parts = []
+
+        # 1. Per-layer stats: (n_layers, n_feat_blocks, 6) → per-feature (n_layers*6,)
+        # Same approach as MLP: flatten all layers for each feature
+        gathered_stats = block_stats[:, bi_arr, :]  # (n_layers, n_features, 6)
+        stats_flat = gathered_stats.transpose(1, 0, 2).reshape(n_features, -1)  # (n_features, n_layers*6)
+        parts.append(stats_flat)
+
+        # 2. Raw key layers: (3, n_feat_blocks, emsize) → per-feature (3*emsize,)
+        if raw_key is not None:
+            gathered_key = raw_key[:, bi_arr, :]  # (3, n_features, emsize)
+            key_flat = gathered_key.transpose(1, 0, 2).reshape(n_features, -1)  # (n_features, 3*emsize)
+            parts.append(key_flat)
+
+        # 3. Raw average: (n_feat_blocks, emsize) → per-feature (emsize,)
+        if raw_avg is not None:
+            gathered_avg = raw_avg[bi_arr, :]  # (n_features, emsize)
+            parts.append(gathered_avg)
+
+        if not parts:
+            return None
+
+        return np.concatenate(parts, axis=1).astype(np.float32)
 
     def _process_between_features_attention(
         self,

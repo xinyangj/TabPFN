@@ -97,6 +97,14 @@ class GPUStatsComputer:
                         (n_attn_layers, n_fb, n_h, 2), dtype=np.float32
                     )
 
+        # Hidden state gradients (enriched mode only)
+        if self.enriched:
+            hidden_grads = signals.get("hidden_state_gradients")
+            if hidden_grads and isinstance(hidden_grads, dict):
+                hg_result = self._compute_hidden_grad_stats(hidden_grads)
+                if hg_result is not None:
+                    result.update(hg_result)
+
         return result
 
     def _compute_items_attention_stats(
@@ -105,6 +113,8 @@ class GPUStatsComputer:
     ) -> np.ndarray | None:
         """Compute per-block stats for between-items attention on GPU.
 
+        Fully vectorized across layers, blocks, and heads — no Python loops.
+
         Returns: (n_layers, n_blocks, n_heads, n_stats) numpy array.
         n_stats = 9 if enriched, 3 otherwise.
         """
@@ -112,52 +122,46 @@ class GPUStatsComputer:
         for key in sorted(attention_dict.keys()):
             attn = attention_dict[key]
             if attn is not None and isinstance(attn, torch.Tensor):
-                a = attn.float()
-                a = torch.nan_to_num(a, nan=0.0)
-                layer_tensors.append(a)
+                layer_tensors.append(torch.nan_to_num(attn.float(), nan=0.0))
 
         if not layer_tensors:
             return None
 
-        n_layers = len(layer_tensors)
-        n_blocks = layer_tensors[0].shape[0]
-        n_items = layer_tensors[0].shape[1]
-        n_heads = layer_tensors[0].shape[3]
+        # Stack all layers: (n_layers, n_blocks, n_items, n_items, n_heads)
+        all_at = torch.stack(layer_tensors)
+        n_layers, n_blocks, n_items, _, n_heads = all_at.shape
         n_stats = 9 if self.enriched else 3
         has_split = n_train > 0 and n_train < n_items
 
-        device = layer_tensors[0].device
+        device = all_at.device
         block_stats = torch.zeros(n_layers, n_blocks, n_heads, n_stats, device=device)
 
-        for li, at in enumerate(layer_tensors):
-            # at: (n_blocks, n_items, n_items, n_heads)
-            # Entropy: per-row entropy, mean over items
-            row_ent = torch.special.entr(at).sum(dim=2)  # (n_blocks, n_items, n_heads)
-            block_stats[li, :, :, 0] = row_ent.mean(dim=1)
+        # 1. Entropy: per-row entropy, mean over items
+        row_ent = torch.special.entr(all_at).sum(dim=3)  # (L, nb, ni, H)
+        block_stats[:, :, :, 0] = row_ent.mean(dim=2)
 
-            # Max and variance over flattened item dims
-            af = at.reshape(n_blocks, -1, n_heads)  # (n_blocks, n_items*n_items, n_heads)
-            block_stats[li, :, :, 1] = af.max(dim=1).values
-            block_stats[li, :, :, 2] = af.var(dim=1)
+        # 2-3. Max and variance over flattened item dims
+        af = all_at.reshape(n_layers, n_blocks, -1, n_heads)  # (L, nb, ni*ni, H)
+        max_vals = af.max(dim=2).values  # (L, nb, H)
+        block_stats[:, :, :, 1] = max_vals
+        block_stats[:, :, :, 2] = af.var(dim=2)
 
-            if self.enriched and has_split:
-                for h in range(n_heads):
-                    ah = at[:, :, :, h]  # (n_blocks, n_items, n_items)
-                    # 4. train_to_test
-                    t2t = ah[:, :n_train, n_train:].mean(dim=(1, 2))
-                    block_stats[li, :, h, 3] = t2t
-                    # 5. test_to_train
-                    block_stats[li, :, h, 4] = ah[:, n_train:, :n_train].mean(dim=(1, 2))
-                    # 6. self_train
-                    self_train = ah[:, :n_train, :n_train].mean(dim=(1, 2))
-                    block_stats[li, :, h, 5] = self_train
-                    # 7. self_test
-                    block_stats[li, :, h, 6] = ah[:, n_train:, n_train:].mean(dim=(1, 2))
-                    # 8. train_test_ratio
-                    block_stats[li, :, h, 7] = t2t / (self_train + 1e-10)
-                    # 9. concentration: max / mean_row_sum
-                    row_sums = ah.sum(dim=2).mean(dim=1)  # (n_blocks,)
-                    block_stats[li, :, h, 8] = af[:, :, h].max(dim=1).values / (row_sums + 1e-10)
+        if self.enriched and has_split:
+            # 4. train_to_test
+            t2t = all_at[:, :, :n_train, n_train:, :].mean(dim=(2, 3))  # (L, nb, H)
+            block_stats[:, :, :, 3] = t2t
+            # 5. test_to_train
+            block_stats[:, :, :, 4] = all_at[:, :, n_train:, :n_train, :].mean(dim=(2, 3))
+            # 6. self_train
+            self_train = all_at[:, :, :n_train, :n_train, :].mean(dim=(2, 3))
+            block_stats[:, :, :, 5] = self_train
+            # 7. self_test
+            block_stats[:, :, :, 6] = all_at[:, :, n_train:, n_train:, :].mean(dim=(2, 3))
+            # 8. train_test_ratio
+            block_stats[:, :, :, 7] = t2t / (self_train + 1e-10)
+            # 9. concentration: max / mean_row_sum
+            row_sums = all_at.sum(dim=3).mean(dim=2)  # (L, nb, H)
+            block_stats[:, :, :, 8] = max_vals / (row_sums + 1e-10)
 
         return block_stats.cpu().numpy()
 
@@ -175,114 +179,96 @@ class GPUStatsComputer:
         for key in sorted(attention_dict.keys()):
             attn = attention_dict[key]
             if attn is not None and isinstance(attn, torch.Tensor):
-                a = attn.float()
-                a = torch.nan_to_num(a, nan=0.0)
-                layer_tensors.append(a)
+                layer_tensors.append(torch.nan_to_num(attn.float(), nan=0.0))
 
         if not layer_tensors:
             return None
 
-        n_layers = len(layer_tensors)
-        # Shape: (batch_items, n_blocks, n_blocks, n_heads)
-        n_blocks = layer_tensors[0].shape[1]
-        n_heads = layer_tensors[0].shape[3]
+        # Stack all layers: (n_layers, batch_items, n_blocks, n_blocks, n_heads)
+        all_at = torch.stack(layer_tensors)
+        n_layers = all_at.shape[0]
+        n_blocks = all_at.shape[2]
+        n_heads = all_at.shape[4]
         target_block = n_blocks - 1
         n_feat_blocks = n_blocks - 1
         n_stats = 15 if self.enriched else 6
 
-        device = layer_tensors[0].device
+        device = all_at.device
+
+        # Mean over batch_items: (n_layers, n_blocks, n_blocks, n_heads)
+        mean_at = all_at.mean(dim=1)
+        del all_at
+
         block_stats = torch.zeros(n_layers, n_feat_blocks, n_heads, n_stats, device=device)
-        to_target_per_layer = torch.zeros(n_layers, n_feat_blocks, device=device)
 
-        for li, at in enumerate(layer_tensors):
-            # Mean over batch_items: (n_blocks, n_blocks, n_heads)
-            mean_at = at.mean(dim=0)
+        diag_idx = torch.arange(n_feat_blocks, device=device)
+        feat_feat = mean_at[:, :n_feat_blocks, :n_feat_blocks, :]
 
-            for h in range(n_heads):
-                ah = mean_at[:, :, h]  # (n_blocks, n_blocks)
-                feat_ah = ah[:n_feat_blocks, :]  # (n_feat_blocks, n_blocks)
+        # 1. self-attention (diagonal)
+        block_stats[:, :, :, 0] = feat_feat[:, diag_idx, diag_idx, :]
 
-                # 1. self-attention: diagonal
-                block_stats[li, :, h, 0] = torch.diagonal(ah)[:n_feat_blocks]
-                # 2. to_target
-                to_target = feat_ah[:, target_block]
-                block_stats[li, :, h, 1] = to_target
-                # 3. from_target
-                from_target = ah[target_block, :n_feat_blocks]
-                block_stats[li, :, h, 2] = from_target
+        # 2. to_target
+        to_target = mean_at[:, :n_feat_blocks, target_block, :]
+        block_stats[:, :, :, 1] = to_target
 
-                if n_feat_blocks > 1:
-                    out_to_feats = feat_ah[:, :n_feat_blocks]  # (n_fb, n_fb)
-                    in_from_feats = ah[:n_feat_blocks, :n_feat_blocks]  # same as out_to_feats for symmetric
-                    diag_vals = torch.diagonal(out_to_feats)
-                    row_sums = out_to_feats.sum(dim=1)
-                    col_sums = out_to_feats.sum(dim=0)
-                    n_others = max(n_feat_blocks - 1, 1)
+        # 3. from_target
+        from_target = mean_at[:, target_block, :n_feat_blocks, :]
+        block_stats[:, :, :, 2] = from_target
 
-                    # 4. mean_to_others
-                    mean_to_others = (row_sums - diag_vals) / n_others
-                    block_stats[li, :, h, 3] = mean_to_others
-                    # 5. mean_from_others
-                    block_stats[li, :, h, 4] = (col_sums - diag_vals) / n_others
+        if n_feat_blocks > 1:
+            diag_vals = feat_feat[:, diag_idx, diag_idx, :]
+            row_sums = feat_feat.sum(dim=2)
+            col_sums = feat_feat.sum(dim=1)
+            n_others = max(n_feat_blocks - 1, 1)
 
-                    if self.enriched:
-                        # For per-block masked stats, use masking via setting diagonal to -inf/0
-                        # 7. max_to_others: max of outgoing excluding self
-                        out_masked = out_to_feats.clone()
-                        out_masked.fill_diagonal_(-float('inf'))
-                        block_stats[li, :, h, 6] = out_masked.max(dim=1).values
+            mean_to_others = (row_sums - diag_vals) / n_others
+            block_stats[:, :, :, 3] = mean_to_others
+            block_stats[:, :, :, 4] = (col_sums - diag_vals) / n_others
 
-                        # 8. std_to_others
-                        # Replace -inf with 0 for std computation
-                        out_for_std = out_to_feats.clone()
-                        out_for_std.fill_diagonal_(0.0)
-                        out_sum = out_for_std.sum(dim=1)
-                        out_sq_sum = (out_for_std ** 2).sum(dim=1)
-                        out_mean = out_sum / n_others
-                        block_stats[li, :, h, 7] = ((out_sq_sum / n_others - out_mean ** 2).clamp(min=0)).sqrt()
+            if self.enriched:
+                masked_feat = feat_feat.clone()
+                masked_feat[:, diag_idx, diag_idx, :] = float('-inf')
+                zero_diag_feat = feat_feat.clone()
+                zero_diag_feat[:, diag_idx, diag_idx, :] = 0.0
 
-                        # 9. max_from_others: max of incoming excluding self
-                        in_masked = in_from_feats.clone()
-                        in_masked.fill_diagonal_(-float('inf'))
-                        block_stats[li, :, h, 8] = in_masked.max(dim=0).values
+                block_stats[:, :, :, 6] = masked_feat.max(dim=2).values
 
-                        # 10. std_from_others
-                        in_for_std = in_from_feats.clone()
-                        in_for_std.fill_diagonal_(0.0)
-                        in_sum = in_for_std.sum(dim=0)
-                        in_sq_sum = (in_for_std ** 2).sum(dim=0)
-                        in_mean = in_sum / n_others
-                        block_stats[li, :, h, 9] = ((in_sq_sum / n_others - in_mean ** 2).clamp(min=0)).sqrt()
+                out_sum = zero_diag_feat.sum(dim=2)
+                out_sq_sum = (zero_diag_feat ** 2).sum(dim=2)
+                out_mean = out_sum / n_others
+                block_stats[:, :, :, 7] = ((out_sq_sum / n_others - out_mean ** 2).clamp(min=0)).sqrt()
 
-                        # 11. mean_asymmetry: mean of (out[bi,j] - in[j,bi]) for j≠bi
-                        asym = out_to_feats - in_from_feats.T  # (n_fb, n_fb)
-                        asym_masked = asym.clone()
-                        asym_masked.fill_diagonal_(0.0)
-                        block_stats[li, :, h, 10] = asym_masked.sum(dim=1) / n_others
+                block_stats[:, :, :, 8] = masked_feat.max(dim=1).values
 
-                        # 12. max_abs_asymmetry
-                        asym_abs_masked = asym.abs().clone()
-                        asym_abs_masked.fill_diagonal_(0.0)
-                        block_stats[li, :, h, 11] = asym_abs_masked.max(dim=1).values
+                in_sum = zero_diag_feat.sum(dim=1)
+                in_sq_sum = (zero_diag_feat ** 2).sum(dim=1)
+                in_mean = in_sum / n_others
+                block_stats[:, :, :, 9] = ((in_sq_sum / n_others - in_mean ** 2).clamp(min=0)).sqrt()
 
-                # 6. entropy
-                a_clamped = mean_at[:n_feat_blocks, :, h].clamp(min=1e-10)
-                block_stats[li, :, h, 5] = -(a_clamped * a_clamped.log()).sum(dim=1)
+                asym = feat_feat - feat_feat.transpose(1, 2)
+                asym[:, diag_idx, diag_idx, :] = 0.0
+                block_stats[:, :, :, 10] = asym.sum(dim=2) / n_others
 
-                if self.enriched:
-                    # 13. target_out_rank: fraction of outgoing attns <= to_target
-                    out_row = ah[:n_feat_blocks, :]  # (n_fb, n_blocks)
-                    block_stats[li, :, h, 12] = (out_row <= to_target.unsqueeze(1)).float().mean(dim=1)
+                asym_abs = asym.abs()
+                asym_abs[:, diag_idx, diag_idx, :] = 0.0
+                block_stats[:, :, :, 11] = asym_abs.max(dim=2).values
 
-                    # 14. target_in_rank: fraction of incoming attns <= from_target
-                    in_col = ah[:, :n_feat_blocks].T  # (n_fb, n_blocks)
-                    block_stats[li, :, h, 13] = (in_col <= from_target.unsqueeze(1)).float().mean(dim=1)
+                del masked_feat, zero_diag_feat, asym, asym_abs
 
-                    # 15. contrast_to_target = to_target - mean_to_others
-                    block_stats[li, :, h, 14] = to_target - block_stats[li, :, h, 3]
+        feat_to_all = mean_at[:, :n_feat_blocks, :, :]
+        a_clamped = feat_to_all.clamp(min=1e-10)
+        block_stats[:, :, :, 5] = -(a_clamped * a_clamped.log()).sum(dim=2)
 
-            # to_target cross-layer: mean over heads
-            to_target_per_layer[li] = mean_at[:n_feat_blocks, target_block, :].mean(dim=-1)
+        if self.enriched:
+            block_stats[:, :, :, 12] = (feat_to_all <= to_target.unsqueeze(2)).float().mean(dim=2)
+
+            all_to_feat = mean_at[:, :, :n_feat_blocks, :]
+            in_col = all_to_feat.transpose(1, 2)
+            block_stats[:, :, :, 13] = (in_col <= from_target.unsqueeze(2)).float().mean(dim=2)
+
+            block_stats[:, :, :, 14] = to_target - block_stats[:, :, :, 3]
+
+        to_target_per_layer = mean_at[:, :n_feat_blocks, target_block, :].mean(dim=-1)
 
         return {
             "features_attention_block_stats": block_stats.cpu().numpy(),
@@ -293,6 +279,8 @@ class GPUStatsComputer:
         self, activation_dict: dict[int, torch.Tensor]
     ) -> dict[str, np.ndarray] | None:
         """Compute per-block stats for MLP activations on GPU.
+
+        Fully vectorized across layers — no Python loops.
 
         Returns dict with:
           'block_stats': (n_layers, n_feat_blocks, n_stats) — n_stats=10 if enriched, 5 otherwise
@@ -308,59 +296,45 @@ class GPUStatsComputer:
         target_block = n_blocks - 1
         n_layers = len(sorted_layers)
         n_stats = 10 if self.enriched else 5
-
         device = first_act.device
+
+        # Stack all layers: (L, batch, batch_items, n_blocks, emsize)
+        all_act = torch.stack([activation_dict[k].float() for k in sorted_layers])
+        act_avg = all_act.mean(dim=(1, 2))  # (L, n_blocks, emsize)
+        del all_act
+        feat_acts = act_avg[:, :n_feat_blocks, :]  # (L, nfb, emsize)
+
         block_stats = torch.zeros(n_layers, n_feat_blocks, n_stats, device=device)
 
-        # Store per-block averaged activations for cross-layer stats
+        block_stats[:, :, 0] = feat_acts.mean(dim=2)
+        block_stats[:, :, 1] = feat_acts.std(dim=2)
+        block_stats[:, :, 2] = feat_acts.max(dim=2).values
+        block_stats[:, :, 3] = (feat_acts.abs() < 0.01).float().mean(dim=2)
+        norms = feat_acts.norm(dim=2)
+        block_stats[:, :, 4] = norms
+
         if self.enriched:
-            feat_acts_per_layer = []
+            target_acts = act_avg[:, target_block, :]  # (L, emsize)
+            target_norms = target_acts.norm(dim=1) + 1e-10
+            dot_products = (feat_acts * target_acts.unsqueeze(1)).sum(dim=2)
+            block_stats[:, :, 5] = dot_products / (norms * target_norms.unsqueeze(1) + 1e-10)
 
-        for li, layer_idx in enumerate(sorted_layers):
-            act = activation_dict[layer_idx].float()
-            # act: (batch, batch_items, n_blocks, emsize) → mean over batch+items
-            act_avg = act.mean(dim=(0, 1))  # (n_blocks, emsize)
-            feat_acts = act_avg[:n_feat_blocks]  # (n_feat_blocks, emsize)
+            all_blocks_mean = feat_acts.mean(dim=1, keepdim=True)
+            block_stats[:, :, 6] = (feat_acts - all_blocks_mean).norm(dim=2)
+            block_stats[:, :, 7] = feat_acts.min(dim=2).values
 
-            block_stats[li, :, 0] = feat_acts.mean(dim=1)        # 1. mean
-            block_stats[li, :, 1] = feat_acts.std(dim=1)          # 2. std
-            block_stats[li, :, 2] = feat_acts.max(dim=1).values   # 3. max
-            block_stats[li, :, 3] = (feat_acts.abs() < 0.01).float().mean(dim=1)  # 4. sparsity
-            norms = feat_acts.norm(dim=1)
-            block_stats[li, :, 4] = norms                         # 5. L2 norm
-
-            if self.enriched:
-                feat_acts_per_layer.append(feat_acts.detach())
-                target_act = act_avg[target_block]  # (emsize,)
-
-                # 6. cosine_to_target
-                target_norm = target_act.norm() + 1e-10
-                dot_products = (feat_acts * target_act.unsqueeze(0)).sum(dim=1)
-                block_stats[li, :, 5] = dot_products / (norms * target_norm + 1e-10)
-
-                # 7. diff_from_mean
-                all_blocks_mean = feat_acts.mean(dim=0)  # (emsize,)
-                block_stats[li, :, 6] = (feat_acts - all_blocks_mean.unsqueeze(0)).norm(dim=1)
-
-                # 8. min
-                block_stats[li, :, 7] = feat_acts.min(dim=1).values
-
-                # 9. skewness
-                stds = block_stats[li, :, 1]
-                means = block_stats[li, :, 0]
-                centered = feat_acts - means.unsqueeze(1)
-                safe_stds = torch.where(stds > 1e-10, stds, torch.ones_like(stds))
-                skew = (centered ** 3).mean(dim=1) / (safe_stds ** 3)
-                block_stats[li, :, 8] = torch.where(stds > 1e-10, skew, torch.zeros_like(skew))
-
-                # 10. pos_frac
-                block_stats[li, :, 9] = (feat_acts > 0).float().mean(dim=1)
+            stds = block_stats[:, :, 1]
+            means = block_stats[:, :, 0]
+            centered = feat_acts - means.unsqueeze(2)
+            safe_stds = torch.where(stds > 1e-10, stds, torch.ones_like(stds))
+            skew = (centered ** 3).mean(dim=2) / (safe_stds ** 3)
+            block_stats[:, :, 8] = torch.where(stds > 1e-10, skew, torch.zeros_like(skew))
+            block_stats[:, :, 9] = (feat_acts > 0).float().mean(dim=2)
 
         result = {"block_stats": block_stats.cpu().numpy()}
 
         if self.enriched and n_layers > 0:
-            # Cross-layer stats (3 per block): norm_trend, cosine_first_last, norm_ratio
-            norms_all = block_stats[:, :, 4]  # (n_layers, n_feat_blocks) on GPU
+            norms_all = block_stats[:, :, 4]
             cross = torch.zeros(n_feat_blocks, 3, device=device)
 
             if n_layers > 1:
@@ -368,21 +342,17 @@ class GPUStatsComputer:
                 x_mean = x_arr.mean()
                 x_var = ((x_arr - x_mean) ** 2).sum()
                 if x_var > 0:
-                    # norm_trend
                     cross[:, 0] = (
                         (x_arr.unsqueeze(1) - x_mean) *
                         (norms_all - norms_all.mean(dim=0, keepdim=True))
                     ).sum(dim=0) / x_var
 
-            # cosine_first_last
-            first_acts = feat_acts_per_layer[0]   # (n_feat_blocks, emsize)
-            last_acts = feat_acts_per_layer[-1]
+            first_acts = feat_acts[0]
+            last_acts = feat_acts[-1]
             dot = (first_acts * last_acts).sum(dim=1)
             fn = first_acts.norm(dim=1) + 1e-10
             ln = last_acts.norm(dim=1) + 1e-10
             cross[:, 1] = dot / (fn * ln)
-
-            # norm_ratio
             cross[:, 2] = ln / (fn + 1e-10)
 
             result["cross_layer"] = cross.cpu().numpy()
@@ -395,8 +365,7 @@ class GPUStatsComputer:
         """Compute per-block stats for attention gradients on GPU.
 
         Returns: (n_layers, n_feat_blocks, n_heads, 2) numpy array.
-        If all gradients are None, returns zeros with shape inferred from
-        other signals (to match the CPU code path).
+        If all gradients are None, returns None.
         """
         sorted_keys = sorted(gradient_dict.keys())
         n_layers = len(sorted_keys)
@@ -411,31 +380,25 @@ class GPUStatsComputer:
             else:
                 layer_data.append(None)
 
-        # Find first non-None to get shape
         first_valid = next((t for t in layer_data if t is not None), None)
         if first_valid is None:
-            # All gradients are None — return None and let caller handle it
             return None
 
         n_blocks = first_valid.shape[1]
         n_heads = first_valid.shape[3]
         n_feat_blocks = n_blocks - 1
         target_block = n_blocks - 1
-        n_stats = 2  # enriched=False
 
         device = first_valid.device
-        block_stats = torch.zeros(n_layers, n_feat_blocks, n_heads, n_stats, device=device)
+        block_stats = torch.zeros(n_layers, n_feat_blocks, n_heads, 2, device=device)
 
         for li, grad_t in enumerate(layer_data):
             if grad_t is None:
                 continue
-            # grad_t: (batch_items, n_blocks, n_blocks, n_heads)
             g_avg = grad_t.mean(dim=0)  # (n_blocks, n_blocks, n_heads)
-
-            for h in range(n_heads):
-                gh = g_avg[:, :, h]  # (n_blocks, n_blocks)
-                block_stats[li, :, h, 0] = gh[:n_feat_blocks, target_block]
-                block_stats[li, :, h, 1] = gh[:n_feat_blocks, :].abs().mean(dim=1)
+            # Vectorized across heads
+            block_stats[li, :, :, 0] = g_avg[:n_feat_blocks, target_block, :]
+            block_stats[li, :, :, 1] = g_avg[:n_feat_blocks, :, :].abs().mean(dim=1)
 
         return block_stats.cpu().numpy()
 
@@ -593,3 +556,68 @@ class GPUStatsComputer:
                 result[src_b, dst_b, 0] = rollout[src_start:src_end, dst_start:dst_end].mean()
 
         return result
+
+    @torch.no_grad()
+    def _compute_hidden_grad_stats(
+        self, hidden_grads: dict[int, torch.Tensor]
+    ) -> dict[str, np.ndarray] | None:
+        """Compute per-block stats and raw vectors from hidden state gradients.
+
+        Hidden state gradients have shape (batch, n_items, n_blocks, emsize)
+        per layer. We compute:
+        1. Per-layer stats (6 per block): norm, mean, abs_max, sparsity, std, pos_frac
+        2. Raw 192d vectors for 3 key layers (first, mid, last)
+        3. Layer-averaged raw 192d vector
+
+        Returns dict with:
+          'hidden_grad_block_stats': (n_layers, n_feat_blocks, 6) numpy
+          'hidden_grad_raw_key': (3, n_feat_blocks, emsize) numpy  [layers 0, mid, last]
+          'hidden_grad_raw_avg': (n_feat_blocks, emsize) numpy
+        """
+        sorted_keys = sorted(hidden_grads.keys())
+        if not sorted_keys:
+            return None
+
+        n_layers = len(sorted_keys)
+
+        # Stack all layers: each (batch, n_items, n_blocks, emsize)
+        all_grads = torch.stack([hidden_grads[k].float() for k in sorted_keys])
+        # → (L, batch, n_items, n_blocks, emsize)
+
+        # Mean over batch and items → (L, n_blocks, emsize)
+        grad_avg = all_grads.mean(dim=(1, 2))
+        del all_grads
+
+        n_blocks = grad_avg.shape[1]
+        n_feat_blocks = n_blocks - 1
+        emsize = grad_avg.shape[2]
+
+        # Feature blocks only (exclude target block)
+        feat_grads = grad_avg[:, :n_feat_blocks, :]  # (L, nfb, emsize)
+
+        device = feat_grads.device
+        n_stats = 6
+        block_stats = torch.zeros(n_layers, n_feat_blocks, n_stats, device=device)
+
+        # All stats vectorized across layers and blocks
+        block_stats[:, :, 0] = feat_grads.norm(dim=2)                           # 1. grad_norm
+        block_stats[:, :, 1] = feat_grads.mean(dim=2)                           # 2. grad_mean
+        block_stats[:, :, 2] = feat_grads.abs().max(dim=2).values               # 3. grad_abs_max
+        block_stats[:, :, 3] = (feat_grads.abs() < 0.01).float().mean(dim=2)    # 4. grad_sparsity
+        block_stats[:, :, 4] = feat_grads.std(dim=2)                            # 5. grad_std
+        block_stats[:, :, 5] = (feat_grads > 0).float().mean(dim=2)             # 6. grad_pos_frac
+
+        # Raw gradients for 3 key layers: first (0), mid (L//2), last (L-1)
+        mid = n_layers // 2
+        last = n_layers - 1
+        key_indices = [0, mid, last]
+        raw_key = feat_grads[key_indices]  # (3, nfb, emsize)
+
+        # Layer-averaged raw gradient
+        raw_avg = feat_grads.mean(dim=0)  # (nfb, emsize)
+
+        return {
+            "hidden_grad_block_stats": block_stats.cpu().numpy(),
+            "hidden_grad_raw_key": raw_key.cpu().numpy(),
+            "hidden_grad_raw_avg": raw_avg.cpu().numpy(),
+        }

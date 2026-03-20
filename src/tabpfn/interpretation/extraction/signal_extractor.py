@@ -33,13 +33,21 @@ class SignalExtractor:
     >>> signals = extractor.extract(regressor, X_train, y_train, X_test)
     """
 
-    def __init__(self, *, extract_gradients: bool = True) -> None:
+    def __init__(self, *, extract_gradients: bool | str = True) -> None:
         """Initialize the signal extractor.
 
         Parameters
         ----------
-        extract_gradients : bool
-            Whether to extract gradient signals. Requires backward pass.
+        extract_gradients : bool or str
+            Controls gradient extraction:
+            - ``True``: Full gradients including attention weight gradients.
+              Uses straight-through SDPA for flash attention compatibility.
+            - ``"input_only"``: Only extract ``d(loss)/d(input)`` gradients.
+              Pure SDPA (no ``retain_grad`` on attention weights).  Attention
+              weight *values* are still extracted via post-hoc Q·K computation.
+              Drops 432/1591 dims (attention_gradient stats + items_attention_gradients).
+            - ``False``: No backward pass at all.  Fastest but loses all
+              gradient features (436 dims).
         """
         self.extract_gradients = extract_gradients
 
@@ -83,11 +91,20 @@ class SignalExtractor:
         n_layers = len(encoder_layers)
 
         # Enable attention weight collection
-        self._enable_attention_extraction(encoder_layers, grad=self.extract_gradients)
+        need_attn_grad = self.extract_gradients is True
+        self._enable_attention_extraction(encoder_layers, grad=need_attn_grad)
 
         # Register hooks for MLP activations
         mlp_activations: dict[int, torch.Tensor] = {}
         hooks = self._register_mlp_hooks(encoder_layers, mlp_activations)
+
+        # Register hooks for hidden state gradients (when backward is run)
+        hidden_states: dict[int, torch.Tensor] = {}
+        hidden_hooks: list[torch.utils.hooks.RemovableHook] = []
+        if self.extract_gradients is True or self.extract_gradients == "input_only":
+            hidden_hooks = self._register_hidden_state_hooks(
+                encoder_layers, hidden_states
+            )
 
         try:
             # Prepare input data
@@ -96,8 +113,19 @@ class SignalExtractor:
             )
 
             # Run forward pass
-            if self.extract_gradients:
+            if self.extract_gradients is True:
                 signals = self._forward_with_gradients(
+                    model,
+                    architecture,
+                    X_combined,
+                    y_combined,
+                    single_eval_pos,
+                    encoder_layers,
+                    n_layers,
+                    mlp_activations,
+                )
+            elif self.extract_gradients == "input_only":
+                signals = self._forward_with_input_gradients_only(
                     model,
                     architecture,
                     X_combined,
@@ -119,6 +147,15 @@ class SignalExtractor:
                     mlp_activations,
                 )
 
+            # Collect hidden state gradients (available after backward)
+            if hidden_states:
+                hidden_grads: dict[int, torch.Tensor] = {}
+                for layer_idx, state_tensor in hidden_states.items():
+                    if state_tensor.grad is not None:
+                        hidden_grads[layer_idx] = state_tensor.grad.detach().clone()
+                if hidden_grads:
+                    signals["hidden_state_gradients"] = hidden_grads
+
             signals["n_features"] = X_train.shape[1]
             signals["n_train"] = X_train.shape[0]
             signals["n_test"] = X_test.shape[0]
@@ -128,6 +165,8 @@ class SignalExtractor:
         finally:
             # Clean up hooks and disable attention collection
             for hook in hooks:
+                hook.remove()
+            for hook in hidden_hooks:
                 hook.remove()
             self._disable_attention_extraction(encoder_layers)
 
@@ -152,6 +191,8 @@ class SignalExtractor:
                         True
                     )
             layer.self_attn_between_items.enable_attention_weights_return(True)
+            if grad:
+                layer.self_attn_between_items.enable_attention_grad_retention(True)
 
     def _disable_attention_extraction(self, layers: list[nn.Module]) -> None:
         """Disable attention weight extraction on all layers."""
@@ -160,6 +201,7 @@ class SignalExtractor:
                 layer.self_attn_between_features.enable_attention_weights_return(False)
                 layer.self_attn_between_features.enable_attention_grad_retention(False)
             layer.self_attn_between_items.enable_attention_weights_return(False)
+            layer.self_attn_between_items.enable_attention_grad_retention(False)
 
     def _register_mlp_hooks(
         self, layers: list[nn.Module], storage: dict[int, torch.Tensor]
@@ -177,6 +219,32 @@ class SignalExtractor:
                 storage[layer_idx] = output.detach()
 
             hooks.append(layer.mlp.register_forward_hook(hook_fn))
+        return hooks
+
+    def _register_hidden_state_hooks(
+        self,
+        layers: list[nn.Module],
+        storage: dict[int, torch.Tensor],
+    ) -> list[torch.utils.hooks.RemovableHook]:
+        """Register forward hooks to capture hidden states and retain their gradients.
+
+        Each encoder layer's output tensor is stored and marked with
+        ``retain_grad()`` so that ``d(loss)/d(hidden_state_l)`` is available
+        after the backward pass.
+        """
+        hooks = []
+        for i, layer in enumerate(layers):
+
+            def hook_fn(
+                module: nn.Module,
+                input: tuple[torch.Tensor, ...],
+                output: torch.Tensor,
+                layer_idx: int = i,
+            ) -> None:
+                storage[layer_idx] = output
+                output.retain_grad()
+
+            hooks.append(layer.register_forward_hook(hook_fn))
         return hooks
 
     def _prepare_inputs(
@@ -243,7 +311,12 @@ class SignalExtractor:
         n_layers: int,
         mlp_activations: dict[int, torch.Tensor],
     ) -> dict[str, Any]:
-        """Run forward pass with gradient computation."""
+        """Run forward pass with full gradient computation.
+
+        Uses straight-through SDPA: forward values from flash attention,
+        backward flows through shadow softmax(QK^T)@V for attention weight
+        gradients.
+        """
         x_input = x.detach().clone().requires_grad_(True)
 
         output = architecture.forward(
@@ -257,6 +330,7 @@ class SignalExtractor:
 
         # Collect attention gradients
         attention_gradients: dict[str, torch.Tensor | None] = {}
+        items_attention_gradients: dict[str, torch.Tensor | None] = {}
         for i, layer in enumerate(encoder_layers):
             if layer.self_attn_between_features is not None:
                 attn_w = layer.self_attn_between_features.get_attention_weights()
@@ -265,6 +339,12 @@ class SignalExtractor:
                 )
             else:
                 attention_gradients[f"layer_{i}"] = None
+
+            # Items attention gradients
+            items_attn_w = layer.self_attn_between_items.get_attention_weights()
+            items_attention_gradients[f"layer_{i}"] = (
+                items_attn_w.grad.detach().clone() if items_attn_w is not None and items_attn_w.grad is not None else None
+            )
 
         input_gradients = x_input.grad.detach().clone() if x_input.grad is not None else None
 
@@ -275,6 +355,56 @@ class SignalExtractor:
             mlp_activations,
             input_gradients=input_gradients,
             attention_gradients=attention_gradients,
+            items_attention_gradients=items_attention_gradients,
+        )
+
+    def _forward_with_input_gradients_only(
+        self,
+        model: Any,
+        architecture: nn.Module,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        single_eval_pos: int,
+        encoder_layers: list[nn.Module],
+        n_layers: int,
+        mlp_activations: dict[int, torch.Tensor],
+    ) -> dict[str, Any]:
+        """Run forward pass extracting only input gradients (d(loss)/d(input)).
+
+        Uses pure SDPA (no retain_grad on attention weights). Attention weight
+        *values* are still collected via post-hoc Q·K computation (detached).
+        This is faster than full gradient extraction because SDPA's fused
+        kernel handles the forward pass and its backward computes input
+        gradients without materialising the full attention matrix.
+        """
+        x_input = x.detach().clone().requires_grad_(True)
+
+        output = architecture.forward(
+            x_input, y, only_return_standard_out=False
+        )
+
+        predictions = output["standard"]
+        loss = predictions.mean()
+        loss.backward(retain_graph=True)
+
+        input_gradients = x_input.grad.detach().clone() if x_input.grad is not None else None
+
+        # Attention weight gradients are NOT collected — return None dicts
+        attention_gradients: dict[str, torch.Tensor | None] = {
+            f"layer_{i}": None for i in range(n_layers)
+        }
+        items_attention_gradients: dict[str, torch.Tensor | None] = {
+            f"layer_{i}": None for i in range(n_layers)
+        }
+
+        return self._collect_signals(
+            encoder_layers,
+            n_layers,
+            {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in output.items()},
+            mlp_activations,
+            input_gradients=input_gradients,
+            attention_gradients=attention_gradients,
+            items_attention_gradients=items_attention_gradients,
         )
 
     def _collect_signals(
@@ -286,6 +416,7 @@ class SignalExtractor:
         *,
         input_gradients: torch.Tensor | None,
         attention_gradients: dict[str, torch.Tensor | None] | None,
+        items_attention_gradients: dict[str, torch.Tensor | None] | None = None,
     ) -> dict[str, Any]:
         """Collect all extracted signals into a dictionary."""
         between_features_attention: dict[str, torch.Tensor | None] = {}
@@ -316,5 +447,6 @@ class SignalExtractor:
             "test_embeddings": test_emb.detach().clone() if isinstance(test_emb, torch.Tensor) else None,
             "input_gradients": input_gradients,
             "attention_gradients": attention_gradients,
+            "items_attention_gradients": items_attention_gradients,
             "mlp_activations": {k: v.clone() for k, v in mlp_activations.items()},
         }
