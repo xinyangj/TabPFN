@@ -558,6 +558,7 @@ class MultiHeadAttention(Attention):
             self.dropout_p,
             self.softmax_scale,
             return_attention_weights=self._return_attention_weights,
+            retain_grad_for_attention=self._retain_grad_for_attention,
         )
 
         # Cache attention weights if enabled
@@ -663,8 +664,18 @@ class MultiHeadAttention(Attention):
         dropout_p: float | None = None,
         softmax_scale: float | None = None,
         return_attention_weights: bool = False,
+        retain_grad_for_attention: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Compute attention heads.
+
+        Always uses SDPA (flash attention) for the forward computation when
+        available.  When attention weights are requested:
+
+        - **Without gradients**: weights computed post-hoc from detached Q, K.
+        - **With gradients**: uses the straight-through estimator — forward
+          values come from SDPA, but backward flows through a differentiable
+          shadow computation ``softmax(QK^T) @ V``, giving exact attention
+          weight gradients while keeping SDPA's fused forward speed.
 
         Returns
         -------
@@ -694,43 +705,80 @@ class MultiHeadAttention(Attention):
 
         attention_weights: torch.Tensor | None = None
 
-        if TORCH_2_ATTENTION_POSSIBLE and not return_attention_weights:
-            # Use optimized PyTorch 2.0 attention when we don't need weights
+        if TORCH_2_ATTENTION_POSSIBLE:
+            # --- SDPA path (fused kernel) ---
             extra_inputs = {}
             if softmax_scale is not None:
                 extra_inputs["scale"] = softmax_scale
 
-            # Check if we should use PyTorch 2.0's GQA support
             if USE_TORCH_2_GQA:
                 extra_inputs["enable_gqa"] = True
+                k_sdpa = k
+                v_sdpa = v
             else:
-                k = MultiHeadAttention.broadcast_kv_across_heads(
-                    k,
-                    share_kv_across_n_heads,
+                k_sdpa = MultiHeadAttention.broadcast_kv_across_heads(
+                    k, share_kv_across_n_heads,
                 )
-                v = MultiHeadAttention.broadcast_kv_across_heads(
-                    v,
-                    share_kv_across_n_heads,
+                v_sdpa = MultiHeadAttention.broadcast_kv_across_heads(
+                    v, share_kv_across_n_heads,
                 )
 
-            attention_head_outputs = (
+            sdpa_output = (
                 MultiHeadAttention.scaled_dot_product_attention_chunked(
                     q.transpose(1, 2),
-                    k.transpose(1, 2),
-                    v.transpose(1, 2),
+                    k_sdpa.transpose(1, 2),
+                    v_sdpa.transpose(1, 2),
                     dropout_p=dropout_p,
                     **extra_inputs,
                 )
             )
-            attention_head_outputs = attention_head_outputs.transpose(1, 2)
+            sdpa_output = sdpa_output.transpose(1, 2)
+
+            if return_attention_weights:
+                k_broad = (
+                    k_sdpa if not USE_TORCH_2_GQA
+                    else MultiHeadAttention.broadcast_kv_across_heads(
+                        k, share_kv_across_n_heads,
+                    )
+                )
+                scale = (
+                    softmax_scale if softmax_scale is not None
+                    else torch.sqrt(torch.tensor(1.0 / d_k)).to(q.device)
+                )
+
+                if retain_grad_for_attention:
+                    # Straight-through estimator: SDPA forward values,
+                    # gradients flow through shadow (manual) computation.
+                    logits = torch.einsum(
+                        "b q h d, b k h d -> b q k h", q, k_broad
+                    )
+                    logits = logits * scale
+                    attention_weights = torch.softmax(logits, dim=2)
+                    shadow_output = torch.einsum(
+                        "b q k h, b k h d -> b q h d",
+                        attention_weights, v_sdpa,
+                    )
+                    # Forward = SDPA values; backward = through shadow
+                    attention_head_outputs = (
+                        shadow_output + (sdpa_output - shadow_output).detach()
+                    )
+                else:
+                    # Detached weights — no gradient needed
+                    logits = torch.einsum(
+                        "b q h d, b k h d -> b q k h",
+                        q.detach(), k_broad.detach(),
+                    )
+                    logits = logits * scale
+                    attention_weights = torch.softmax(logits, dim=2)
+                    attention_head_outputs = sdpa_output
+            else:
+                attention_head_outputs = sdpa_output
 
         else:
-            # Use fallback path that computes attention weights explicitly
-            # (Either PyTorch < 2.0 or we need to return attention weights)
+            # PyTorch < 2.0 fallback: manual attention
             k = MultiHeadAttention.broadcast_kv_across_heads(k, share_kv_across_n_heads)
             v = MultiHeadAttention.broadcast_kv_across_heads(v, share_kv_across_n_heads)
 
-            # Compute attention logits
             logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
             logits *= (
                 torch.sqrt(torch.tensor(1.0 / d_k)).to(k.device)
@@ -738,7 +786,6 @@ class MultiHeadAttention(Attention):
                 else softmax_scale
             )
 
-            # Compute attention weights
             attention_weights = torch.softmax(logits, dim=2)
             ps = torch.dropout(attention_weights, dropout_p, train=True)
             attention_head_outputs = torch.einsum("b q k h, b k h d -> b q h d", ps, v)

@@ -30,6 +30,10 @@ class PerFeatureMLP(nn.Module):
         Dropout probability.
     output_mode : str
         "binary" for sigmoid output, "continuous" for raw output.
+    norm : str or None
+        Normalization layer: "layer", "batch", or None.
+    activation : str
+        Activation function: "relu", "gelu", or "leaky_relu".
     """
 
     def __init__(
@@ -39,25 +43,52 @@ class PerFeatureMLP(nn.Module):
         hidden_dims: list[int] | None = None,
         dropout: float = 0.1,
         output_mode: Literal["binary", "continuous"] = "binary",
+        norm: str | None = None,
+        activation: str = "relu",
+        input_batch_norm: bool = False,
     ) -> None:
         super().__init__()
         if hidden_dims is None:
             hidden_dims = [512, 256, 128]
 
         self.output_mode = output_mode
+        self.input_bn = nn.BatchNorm1d(input_dim) if input_batch_norm else None
+        # Global z-score normalization (precomputed from training data)
+        self.register_buffer("global_mean", None)
+        self.register_buffer("global_std", None)
+
+        act_fn = {"relu": nn.ReLU, "gelu": nn.GELU, "leaky_relu": nn.LeakyReLU}
+        act_cls = act_fn.get(activation, nn.ReLU)
 
         layers: list[nn.Module] = []
         in_dim = input_dim
         for h_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(in_dim, h_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            ])
+            layers.append(nn.Linear(in_dim, h_dim))
+            if norm == "layer":
+                layers.append(nn.LayerNorm(h_dim))
+            elif norm == "batch":
+                layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(act_cls())
+            layers.append(nn.Dropout(dropout))
             in_dim = h_dim
 
         layers.append(nn.Linear(in_dim, 1))
         self.mlp = nn.Sequential(*layers)
+
+    def set_global_norm_stats(
+        self, mean: torch.Tensor, std: torch.Tensor
+    ) -> None:
+        """Set precomputed training statistics for global z-score normalization.
+
+        Parameters
+        ----------
+        mean : torch.Tensor
+            Per-dimension mean, shape (input_dim,).
+        std : torch.Tensor
+            Per-dimension std, shape (input_dim,).
+        """
+        self.global_mean = mean.detach()
+        self.global_std = std.detach()
 
     def forward(
         self,
@@ -82,7 +113,15 @@ class PerFeatureMLP(nn.Module):
         # Apply same MLP to each feature independently
         # x: (B, F, D) -> (B*F, D) -> MLP -> (B*F, 1) -> (B, F)
         B, F, D = x.shape
-        out = self.mlp(x.reshape(B * F, D))  # (B*F, 1)
+        flat = x.reshape(B * F, D)
+
+        # Input normalization (global z-score takes priority over BN)
+        if self.global_mean is not None:
+            flat = (flat - self.global_mean) / (self.global_std + 1e-8)
+        elif self.input_bn is not None:
+            flat = self.input_bn(flat)
+
+        out = self.mlp(flat)  # (B*F, 1)
         out = out.reshape(B, F)  # (B, F)
 
         if mask is not None:
@@ -221,6 +260,13 @@ class InterpretationModel(nn.Module):
             )
         else:
             raise ValueError(f"Unknown variant: {variant}")
+
+    def set_global_norm_stats(
+        self, mean: torch.Tensor, std: torch.Tensor
+    ) -> None:
+        """Set precomputed training statistics for global z-score normalization."""
+        if hasattr(self.model, "set_global_norm_stats"):
+            self.model.set_global_norm_stats(mean, std)
 
     def forward(
         self,
