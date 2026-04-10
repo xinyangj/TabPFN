@@ -215,6 +215,8 @@ def generate_and_cache(
     seed: int = 42,
     start_idx: int = 0,
     cache_dir: Path | None = None,
+    *,
+    force: bool = False,
 ) -> None:
     """Generate datasets and save each to disk individually."""
     from tabpfn import TabPFNRegressor
@@ -246,7 +248,7 @@ def generate_and_cache(
 
     for i in range(start_idx, start_idx + n_datasets):
         out_path = cache_dir / f"dataset_{i:06d}.npz"
-        if out_path.exists():
+        if out_path.exists() and not force:
             n_saved += 1
             # Still advance rng to keep determinism
             _sample_n_features(rng)
@@ -292,6 +294,7 @@ def generate_and_cache(
                 "embeddings",
                 "mlp_activations",
                 "gradients",
+                "items_attention_gradients",
             ]
             for cat in CATEGORIES:
                 try:
@@ -385,6 +388,8 @@ if __name__ == "__main__":
     parser.add_argument("--start_idx", type=int, default=0, help="Resume from this index")
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite existing files (for regeneration with enriched signals)")
     args = parser.parse_args()
 
     if args.device:
@@ -396,4 +401,5 @@ if __name__ == "__main__":
         seed=args.seed,
         start_idx=args.start_idx,
         cache_dir=cache,
+        force=args.force,
     )
