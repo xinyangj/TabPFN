@@ -145,12 +145,32 @@ def _interventional(
 
     For each feature X_i, compute |E[Y | do(X_i = high)] - E[Y | do(X_i = low)]|
     by simulating interventions through the SCM.
+
+    Falls back to a data-driven proxy (binary_ancestry weighted by observed
+    correlation) when edge functions are not available.
     """
     dag = dataset.dag
     target = dataset.target_node
     n_features = dataset.X.shape[1]
-    n_nodes = n_features + 1
 
+    # If edge functions are not available, use a data-driven proxy
+    if not dataset.edge_functions:
+        # Proxy: binary ancestry weighted by |correlation with y|
+        ancestry = _binary_ancestry(dag, target, n_features)
+        correlations = np.zeros(n_features)
+        for i in range(n_features):
+            std_x = np.std(dataset.X[:, i])
+            std_y = np.std(dataset.y)
+            if std_x > 1e-10 and std_y > 1e-10:
+                correlations[i] = abs(np.corrcoef(dataset.X[:, i], dataset.y)[0, 1])
+        # Combine: causal ancestor × correlation strength
+        importance = ancestry * correlations
+        max_imp = importance.max()
+        if max_imp > 0:
+            importance = importance / max_imp
+        return importance
+
+    n_nodes = n_features + 1
     importance = np.zeros(n_features)
     topo_order = list(nx.topological_sort(dag))
 
@@ -177,8 +197,9 @@ def _interventional(
                 else:
                     value = np.zeros(n_samples)
                     for parent in parents:
-                        edge_fn = dataset.edge_functions[(parent, node)]
-                        value += edge_fn(node_values[:, parent])
+                        edge_fn = dataset.edge_functions.get((parent, node))
+                        if edge_fn is not None:
+                            value += edge_fn(node_values[:, parent])
                     value += rng.normal(0, dataset.noise_std, size=n_samples)
                     node_values[:, node] = value
 

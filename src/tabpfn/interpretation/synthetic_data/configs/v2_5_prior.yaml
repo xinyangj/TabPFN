@@ -1,0 +1,104 @@
+# TabPFN v2.5 Extended Synthetic Data Generation Configuration
+# Based on v2 Nature paper prior (Hollmann et al., 2025) extended for v2.5 scale.
+# v2 baseline: n_features Beta(0.95,8)×[1,160], n_samples U(100,2048), 75K max cells
+# v2.5 extension: up to 1000 features, up to 10,000 samples
+
+dataset:
+  n_samples:
+    min: 50
+    max: 10000
+    distribution: "uniform"
+  n_features:
+    distribution: "beta"
+    params:
+      alpha: 0.95
+      beta: 8.0
+    range: [3, 1000]
+  max_cells: 500000
+  train_val_split: 0.8
+
+graph:
+  n_nodes:
+    distribution: "log_uniform"
+    min: 5
+    max: 200
+  redirection_probability:
+    distribution: "gamma"
+    alpha: 2.0
+    beta: 1.0
+  graph_type: "scale_free"
+  ensure_connected: true
+
+edges:
+  vector_dim: 8
+  type_probabilities:
+    neural_network: 0.4
+    discretization: 0.2
+    decision_tree: 0.2
+    noise: 0.2
+
+  neural_network:
+    activations: ["identity", "sigmoid", "relu", "tanh", "sin", "abs", "square", "log", "exp"]
+    hidden_dims: [8, 16, 32, 64]
+    use_bias: true
+    initialization: "xavier"
+
+  discretization:
+    gamma_alpha: 2.0
+    gamma_scale: 1.5
+    max_categories: 15
+
+  decision_tree:
+    max_depth: 3
+    min_samples_split: 5
+    criterion: "random"
+
+  noise:
+    std_range: [0.01, 0.5]
+    distribution: "normal"
+
+initialization:
+  distribution_types: ["normal", "uniform", "mixed"]
+  normal:
+    mean: 0
+    std: 1
+  uniform:
+    low: -1
+    high: 1
+  non_independence:
+    enabled: true
+    prototype_fraction: 0.3
+    temperature: 1.0
+
+post_processing:
+  kumaraswamy_warping:
+    enabled: true
+    probability: 0.3
+    a_range: [0.5, 2.0]
+    b_range: [0.5, 2.0]
+
+  quantization:
+    enabled: true
+    probability: 0.3
+    n_bins: [5, 10, 20]
+
+  missing_values:
+    enabled: true
+    probability: 0.2
+    missing_rate: [0.0, 0.3]
+    mechanism: "mcar"
+
+target:
+  regression:
+    select_from: "continuous"
+    apply_transform: false
+  classification:
+    select_from: "categorical"
+    max_classes: 10
+
+seed: 42
+deterministic: true
+
+logging:
+  level: "WARNING"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
