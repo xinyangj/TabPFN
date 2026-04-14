@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GNW_JAR = REPO_ROOT / "data" / "gnw" / "gnw-3.1.2b.jar"
 GNW_SETTINGS = REPO_ROOT / "data" / "gnw" / "settings_dream4_size10.txt"
 
-DREAM4_COMPLETE = Path("/tmp/dream4_complete")
+DREAM4_COMPLETE = REPO_ROOT / "data" / "dream4" / "dream4"
 DREAM4_SUPP = Path("/tmp/DREAM4 in-silico challenge/Size 10/Supplementary information")
 
 GENE_NAMES = [f"G{i}" for i in range(1, 11)]
