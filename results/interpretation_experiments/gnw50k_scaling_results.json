@@ -1,0 +1,869 @@
+{
+  "seed": 42,
+  "train_config": {
+    "hidden_dims": [
+      1024,
+      512,
+      256,
+      128
+    ],
+    "lr": 0.0001,
+    "dropout": 0.1,
+    "norm": "layer",
+    "activation": "gelu",
+    "batch_size": 1024,
+    "max_epochs": 300,
+    "patience": 30,
+    "weight_decay": 0.0001
+  },
+  "runs": {
+    "slim_10000": {
+      "variant": "slim",
+      "scale": 10000,
+      "dim": 583,
+      "use_global_norm": true,
+      "n_train": 10000,
+      "n_val": 5000,
+      "best_val_loss": 0.8251375436782837,
+      "best_epoch": 11,
+      "dream4_10": {
+        "avg_auroc": 0.5548800133800134,
+        "avg_aupr": 0.2363673570943746,
+        "std_auroc": 0.030541375048839997,
+        "std_aupr": 0.03458746785503014,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5066666666666666,
+            "aupr": 0.1980990030653732,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5320945945945946,
+            "aupr": 0.29163265363346946,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.5688888888888889,
+            "aupr": 0.24495649406390338,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.5834165834165834,
+            "aupr": 0.24661393254254507,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.5833333333333333,
+            "aupr": 0.20053470216658195,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "slim_20000": {
+      "variant": "slim",
+      "scale": 20000,
+      "dim": 583,
+      "use_global_norm": true,
+      "n_train": 20000,
+      "n_val": 5000,
+      "best_val_loss": 0.8119409203529357,
+      "best_epoch": 8,
+      "dream4_10": {
+        "avg_auroc": 0.5446967922467922,
+        "avg_aupr": 0.19761531766324242,
+        "std_auroc": 0.027656735248655088,
+        "std_aupr": 0.029152145193478467,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5537777777777777,
+            "aupr": 0.25059322281024465,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5177364864864864,
+            "aupr": 0.18071035560254028,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.5244444444444445,
+            "aupr": 0.17691342431024665,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.5944055944055945,
+            "aupr": 0.2073954547868934,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.5331196581196581,
+            "aupr": 0.1724641308062872,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "slim_30000": {
+      "variant": "slim",
+      "scale": 30000,
+      "dim": 583,
+      "use_global_norm": true,
+      "n_train": 30000,
+      "n_val": 5000,
+      "best_val_loss": 0.7976810693740845,
+      "best_epoch": 11,
+      "dream4_10": {
+        "avg_auroc": 0.5839503907503908,
+        "avg_aupr": 0.2309953952637705,
+        "std_auroc": 0.024762621886180183,
+        "std_aupr": 0.05042666856591059,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.6071111111111112,
+            "aupr": 0.24125550936361917,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5472972972972973,
+            "aupr": 0.1944404488615736,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.6088888888888888,
+            "aupr": 0.22943187822839636,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.5624375624375624,
+            "aupr": 0.17116068288063171,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.594017094017094,
+            "aupr": 0.31868845698463144,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "slim_40000": {
+      "variant": "slim",
+      "scale": 40000,
+      "dim": 583,
+      "use_global_norm": true,
+      "n_train": 40000,
+      "n_val": 5000,
+      "best_val_loss": 0.7925698280334472,
+      "best_epoch": 11,
+      "dream4_10": {
+        "avg_auroc": 0.5468141084141085,
+        "avg_aupr": 0.19635034144739136,
+        "std_auroc": 0.08116749601190934,
+        "std_aupr": 0.04123153440232484,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.7013333333333334,
+            "aupr": 0.272343370597831,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.47297297297297297,
+            "aupr": 0.16779983798630432,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.49066666666666664,
+            "aupr": 0.2059689951174806,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.5434565434565435,
+            "aupr": 0.15808276493551693,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.5256410256410257,
+            "aupr": 0.17755673859982402,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "full_10000": {
+      "variant": "full",
+      "scale": 10000,
+      "dim": 1267,
+      "use_global_norm": true,
+      "n_train": 10000,
+      "n_val": 5000,
+      "best_val_loss": 0.827861225605011,
+      "best_epoch": 8,
+      "dream4_10": {
+        "avg_auroc": 0.5758379122379121,
+        "avg_aupr": 0.22462576202491724,
+        "std_auroc": 0.06967445023609509,
+        "std_aupr": 0.05477248993102944,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5422222222222222,
+            "aupr": 0.20059257512385814,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.4864864864864865,
+            "aupr": 0.19620870544188493,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.5813333333333333,
+            "aupr": 0.19114614523836176,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.5704295704295704,
+            "aupr": 0.20125009408667016,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.6987179487179487,
+            "aupr": 0.3339312902338112,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "full_20000": {
+      "variant": "full",
+      "scale": 20000,
+      "dim": 1267,
+      "use_global_norm": true,
+      "n_train": 20000,
+      "n_val": 5000,
+      "best_val_loss": 0.812859046459198,
+      "best_epoch": 12,
+      "dream4_10": {
+        "avg_auroc": 0.552862831012831,
+        "avg_aupr": 0.2195954010157136,
+        "std_auroc": 0.023007820945830437,
+        "std_aupr": 0.03463008606075397,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5315555555555556,
+            "aupr": 0.23379268176321943,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5853040540540541,
+            "aupr": 0.23995418213063502,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.5742222222222222,
+            "aupr": 0.24613157337689723,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.5454545454545454,
+            "aupr": 0.2265317636042204,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.5277777777777778,
+            "aupr": 0.15156680420359592,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "full_30000": {
+      "variant": "full",
+      "scale": 30000,
+      "dim": 1267,
+      "use_global_norm": true,
+      "n_train": 30000,
+      "n_val": 5000,
+      "best_val_loss": 0.796127712726593,
+      "best_epoch": 9,
+      "dream4_10": {
+        "avg_auroc": 0.5555793520293519,
+        "avg_aupr": 0.2128469760859648,
+        "std_auroc": 0.07475372939629951,
+        "std_aupr": 0.07129081008695666,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5555555555555556,
+            "aupr": 0.1920436072025203,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.6444256756756757,
+            "aupr": 0.3417384388595712,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.5351111111111111,
+            "aupr": 0.19376640855602034,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.6143856143856145,
+            "aupr": 0.21329246623561005,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.4284188034188034,
+            "aupr": 0.12339395957610212,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "full_40000": {
+      "variant": "full",
+      "scale": 40000,
+      "dim": 1267,
+      "use_global_norm": true,
+      "n_train": 40000,
+      "n_val": 5000,
+      "best_val_loss": 0.782391357421875,
+      "best_epoch": 11,
+      "dream4_10": {
+        "avg_auroc": 0.5442725436725437,
+        "avg_aupr": 0.2122888049754658,
+        "std_auroc": 0.06727047299374682,
+        "std_aupr": 0.025620303379435504,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5991111111111111,
+            "aupr": 0.21481232762862484,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5405405405405406,
+            "aupr": 0.24004962146874656,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.4177777777777778,
+            "aupr": 0.23109655000487273,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.5624375624375624,
+            "aupr": 0.16599165958378376,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.6014957264957265,
+            "aupr": 0.209493866191301,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "grad_only_10000": {
+      "variant": "grad_only",
+      "scale": 10000,
+      "dim": 112,
+      "use_global_norm": true,
+      "n_train": 10000,
+      "n_val": 5000,
+      "best_val_loss": 0.9316415786743164,
+      "best_epoch": 111,
+      "dream4_10": {
+        "avg_auroc": 0.4368459513459514,
+        "avg_aupr": 0.15486885563657984,
+        "std_auroc": 0.0765184629178204,
+        "std_aupr": 0.04611678911426186,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.49244444444444446,
+            "aupr": 0.16621462082094396,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5557432432432432,
+            "aupr": 0.23806975553749546,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.41422222222222227,
+            "aupr": 0.14239074884718245,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.3596403596403597,
+            "aupr": 0.11928195107075015,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.3621794871794872,
+            "aupr": 0.10838720190652715,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "grad_only_20000": {
+      "variant": "grad_only",
+      "scale": 20000,
+      "dim": 112,
+      "use_global_norm": true,
+      "n_train": 20000,
+      "n_val": 5000,
+      "best_val_loss": 0.931492030620575,
+      "best_epoch": 133,
+      "dream4_10": {
+        "avg_auroc": 0.44563519183519185,
+        "avg_aupr": 0.15721888666610095,
+        "std_auroc": 0.07644660631538668,
+        "std_aupr": 0.04364217409073886,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.4862222222222222,
+            "aupr": 0.16668543600601876,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5675675675675675,
+            "aupr": 0.23606987772808719,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.4355555555555556,
+            "aupr": 0.14646307470607395,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.3916083916083916,
+            "aupr": 0.1252389083655428,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.3472222222222222,
+            "aupr": 0.11163713652478202,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "grad_only_30000": {
+      "variant": "grad_only",
+      "scale": 30000,
+      "dim": 112,
+      "use_global_norm": true,
+      "n_train": 30000,
+      "n_val": 5000,
+      "best_val_loss": 0.9314110279083252,
+      "best_epoch": 45,
+      "dream4_10": {
+        "avg_auroc": 0.43148735228735224,
+        "avg_aupr": 0.15577945200957627,
+        "std_auroc": 0.07901976887990154,
+        "std_aupr": 0.04718200856658887,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.48088888888888887,
+            "aupr": 0.1652873843449415,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5574324324324325,
+            "aupr": 0.24206209245088067,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.4151111111111111,
+            "aupr": 0.14193817449886845,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.3546453546453547,
+            "aupr": 0.1196105500340715,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.34935897435897434,
+            "aupr": 0.10999905871911919,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "grad_only_40000": {
+      "variant": "grad_only",
+      "scale": 40000,
+      "dim": 112,
+      "use_global_norm": true,
+      "n_train": 40000,
+      "n_val": 5000,
+      "best_val_loss": 0.9314503908157349,
+      "best_epoch": 48,
+      "dream4_10": {
+        "avg_auroc": 0.4317617541617541,
+        "avg_aupr": 0.15610421537049476,
+        "std_auroc": 0.08256637578668698,
+        "std_aupr": 0.048769478476596156,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.4764444444444444,
+            "aupr": 0.16264435216242024,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5675675675675675,
+            "aupr": 0.24631971145581538,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.41155555555555556,
+            "aupr": 0.14152237166613085,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.3656343656343657,
+            "aupr": 0.12282132782803862,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.33760683760683763,
+            "aupr": 0.10721331374006866,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "slim_nonorm_10000": {
+      "variant": "slim_nonorm",
+      "scale": 10000,
+      "dim": 583,
+      "use_global_norm": false,
+      "n_train": 10000,
+      "n_val": 5000,
+      "best_val_loss": 0.828473711013794,
+      "best_epoch": 266,
+      "dream4_10": {
+        "avg_auroc": 0.551389962139962,
+        "avg_aupr": 0.21996299405647549,
+        "std_auroc": 0.08046345331236851,
+        "std_aupr": 0.05101281543540071,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5342222222222222,
+            "aupr": 0.2107703976231079,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5920608108108107,
+            "aupr": 0.2728251616623296,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.6168888888888888,
+            "aupr": 0.2836608375696428,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.4015984015984016,
+            "aupr": 0.15380274945993527,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.6121794871794872,
+            "aupr": 0.17875582396736195,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "slim_nonorm_20000": {
+      "variant": "slim_nonorm",
+      "scale": 20000,
+      "dim": 583,
+      "use_global_norm": false,
+      "n_train": 20000,
+      "n_val": 5000,
+      "best_val_loss": 0.8129260659217834,
+      "best_epoch": 249,
+      "dream4_10": {
+        "avg_auroc": 0.5443146571146571,
+        "avg_aupr": 0.22065318615154883,
+        "std_auroc": 0.0583612950011224,
+        "std_aupr": 0.045494486882818784,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5111111111111111,
+            "aupr": 0.20921039602123154,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5405405405405406,
+            "aupr": 0.2103602964047198,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.6471111111111111,
+            "aupr": 0.2912880038680937,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.4715284715284716,
+            "aupr": 0.15189210437243447,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.5512820512820513,
+            "aupr": 0.24051513009126452,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "slim_nonorm_30000": {
+      "variant": "slim_nonorm",
+      "scale": 30000,
+      "dim": 583,
+      "use_global_norm": false,
+      "n_train": 30000,
+      "n_val": 5000,
+      "best_val_loss": 0.8009373664855957,
+      "best_epoch": 270,
+      "dream4_10": {
+        "avg_auroc": 0.5292557225057225,
+        "avg_aupr": 0.2136727824702879,
+        "std_auroc": 0.03037052965428138,
+        "std_aupr": 0.04249555065697553,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5475555555555556,
+            "aupr": 0.21457200901833606,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5532094594594594,
+            "aupr": 0.28610306579908495,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.5591111111111111,
+            "aupr": 0.22429355589654437,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.5034965034965035,
+            "aupr": 0.1802351672525447,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.48290598290598297,
+            "aupr": 0.16316011438492928,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    },
+    "slim_nonorm_40000": {
+      "variant": "slim_nonorm",
+      "scale": 40000,
+      "dim": 583,
+      "use_global_norm": false,
+      "n_train": 40000,
+      "n_val": 5000,
+      "best_val_loss": 0.7966904997825622,
+      "best_epoch": 285,
+      "dream4_10": {
+        "avg_auroc": 0.5006249465249465,
+        "avg_aupr": 0.1826049481430326,
+        "std_auroc": 0.048863895200279873,
+        "std_aupr": 0.02351309739422277,
+        "networks": [
+          {
+            "network": "net1",
+            "auroc": 0.5804444444444444,
+            "aupr": 0.1988570655988312,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net2",
+            "auroc": 0.5050675675675675,
+            "aupr": 0.19271197847125768,
+            "n_edges": 16,
+            "n_total": 90
+          },
+          {
+            "network": "net3",
+            "auroc": 0.5164444444444445,
+            "aupr": 0.17918842325481824,
+            "n_edges": 15,
+            "n_total": 90
+          },
+          {
+            "network": "net4",
+            "auroc": 0.4385614385614386,
+            "aupr": 0.13855150396477367,
+            "n_edges": 13,
+            "n_total": 90
+          },
+          {
+            "network": "net5",
+            "auroc": 0.46260683760683763,
+            "aupr": 0.20371576942548225,
+            "n_edges": 12,
+            "n_total": 90
+          }
+        ]
+      }
+    }
+  }
+}
