@@ -42,40 +42,34 @@ def preprocess_dream4_network(
         print(f"Warning: Network directory not found: {network_subdir}")
         return False
 
-    # Try time series data first (more samples), then multifactorial, then knockdowns
-    # Time series has ~100 samples vs 10 for multifactorial, providing much more data
-    expr_file = None
-    for filename in [
-        f"insilico_size{network_size}_{network_id}_timeseries.tsv",
-        f"insilico_size{network_size}_{network_id}_multifactorial.tsv",
-        f"insilico_size{network_size}_{network_id}_knockdowns.tsv"
-    ]:
-        potential_file = network_subdir / filename
-        if potential_file.exists():
-            expr_file = potential_file
-            break
+    # Stack ALL available expression data types to match GNW training composition.
+    # Order: wildtype, knockouts, knockdowns, multifactorial, timeseries
+    data_types = ["wildtype", "knockouts", "knockdowns", "multifactorial", "timeseries"]
+    prefix_stem = f"insilico_size{network_size}_{network_id}"
 
-    if not expr_file:
+    gene_names = None
+    data_parts = []
+    loaded_types = []
+
+    for dtype in data_types:
+        fpath = network_subdir / f"{prefix_stem}_{dtype}.tsv"
+        if not fpath.exists():
+            continue
+        df = pd.read_csv(fpath, sep="\t")
+        if gene_names is None:
+            gene_names = [col for col in df.columns if col != "Time"]
+        expr = df.drop(columns=["Time"], errors="ignore").values.astype(np.float32)
+        data_parts.append(expr)
+        loaded_types.append(f"{dtype}({expr.shape[0]})")
+
+    if not data_parts:
         print(f"Warning: No expression file found for network {network_id}")
         return False
 
-    print(f"Processing {expr_file.name}...")
-    expr_df = pd.read_csv(expr_file, sep='\t')
-
-    # Get gene names (all columns except 'Time' if present)
-    gene_names = [col for col in expr_df.columns if col != 'Time']
-
-    # Extract expression matrix (drop Time column if present)
-    # This gives us samples x genes format
-    if 'Time' in expr_df.columns:
-        expression = expr_df.drop(columns=['Time']).values.astype(np.float32)
-    else:
-        expression = expr_df.values.astype(np.float32)
-
-    # Keep as samples x genes format (no transpose)
+    expression = np.vstack(data_parts)
+    print(f"  Stacked {' + '.join(loaded_types)} = {expression.shape[0]} samples")
     print(f"  Expression shape: {expression.shape} (samples x genes)")
     print(f"  Number of genes: {len(gene_names)}")
-    print(f"  Number of samples: {expression.shape[0]}")
     
     # 2. Load gold standard
     gold_file = gold_dir / f"DREAM4_GoldStandard_InSilico_Size{network_size}_{network_id}.tsv"
