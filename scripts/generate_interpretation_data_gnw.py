@@ -92,6 +92,7 @@ def gen_worker(
     cache_dir: Path,
     force: bool,
     dream4_aligned: bool = False,
+    allow_cycles: bool = False,
 ):
     """Thread 1: Generate synthetic datasets using GNW on CPU."""
     from tabpfn.interpretation.synthetic_data.gnw_generator import generate_gnw_dataset
@@ -117,6 +118,7 @@ def gen_worker(
                 graph_type=graph_type,
                 rng=np.random.default_rng(rng.integers(0, 2**31)),
                 dream4_size10=dream4_aligned,
+                allow_cycles=allow_cycles,
             )
             gen_time = time.time() - t0
 
@@ -302,6 +304,7 @@ def generate_and_cache(
     force: bool = False,
     use_amp: bool = True,
     dream4_aligned: bool = False,
+    allow_cycles: bool = False,
 ) -> None:
     """Run 3-stage async pipeline: GNW gen → GPU extract → process → save."""
     if cache_dir is None:
@@ -326,7 +329,8 @@ def generate_and_cache(
 
     t1 = threading.Thread(
         target=gen_worker,
-        args=(rng, gen_queue, index_iter, cache_dir, force, dream4_aligned),
+        args=(rng, gen_queue, index_iter, cache_dir, force, dream4_aligned,
+              allow_cycles),
         name="GenWorker",
         daemon=True,
     )
@@ -349,9 +353,10 @@ def generate_and_cache(
 
     amp_str = "bfloat16" if use_amp else "disabled"
     align_str = "DREAM4-10 aligned" if dream4_aligned else "default"
+    cycle_str = "+cycles" if allow_cycles else "DAG-only"
     logger.info(
         f"Pipeline started: {n_datasets} datasets, device={DEVICE}, amp={amp_str}, "
-        f"start_idx={start_idx}, seed={seed}, generator=GNW ({align_str})"
+        f"start_idx={start_idx}, seed={seed}, generator=GNW ({align_str}, {cycle_str})"
     )
 
     n_saved = 0
@@ -444,6 +449,7 @@ def generate_and_cache(
         "start_idx": start_idx,
         "n_genes": N_GENES,
         "dream4_aligned": dream4_aligned,
+        "allow_cycles": allow_cycles,
         "generator": "GeneNetWeaver 3.1.2b (thermodynamic TF-binding, mRNA+protein ODE/SDE)",
         "settings_file": settings_str,
         "modes": modes_str,
@@ -478,6 +484,11 @@ if __name__ == "__main__":
              "original source networks (RegulonDB 6.2 + Yeast Balaji 2006), "
              "edge range 12-16, variable activation ratio, no self-loops",
     )
+    parser.add_argument(
+        "--allow_cycles", action="store_true",
+        help="Generate cyclic directed graphs instead of DAGs. Matches DREAM4 "
+             "cycle statistics (~30-60%% edges in feedback cycles).",
+    )
     args = parser.parse_args()
 
     if args.device:
@@ -492,4 +503,5 @@ if __name__ == "__main__":
         force=args.force,
         use_amp=not args.no_amp,
         dream4_aligned=args.dream4_aligned,
+        allow_cycles=args.allow_cycles,
     )

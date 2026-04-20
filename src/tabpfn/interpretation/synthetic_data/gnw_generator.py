@@ -67,11 +67,16 @@ def _generate_random_dag(
     max_edges: int | None = None,
     min_tfs: int | None = None,
     dream4_size10: bool = False,
+    allow_cycles: bool = False,
 ) -> nx.DiGraph:
-    """Generate a random DAG matching DREAM4-10 scale.
+    """Generate a random directed network matching DREAM4-10 scale.
 
     For 10-gene networks: targets ~12-16 edges, ≥7 active TFs.
     When dream4_size10=True: tightens to exact DREAM4-10 range (12-16 edges).
+
+    When allow_cycles=True, generates cyclic directed graphs matching DREAM4-10
+    cycle statistics (~30-60% edges in cycles, 1-2 SCCs of size 2-6).
+    Otherwise forces acyclic (DAG) via topological ordering.
     """
     if dream4_size10:
         # Exact DREAM4-10 gold standard range: 12, 13, 15, 15, 16
@@ -89,9 +94,8 @@ def _generate_random_dag(
         if min_tfs is None:
             min_tfs = max(2, int(0.6 * n_genes))
 
-    for _attempt in range(200):
+    for _attempt in range(500 if allow_cycles else 200):
         if graph_type == "erdos_renyi":
-            # p=0.30 for directed, ~half survive DAG orientation
             p = 0.30 if n_genes <= 15 else 0.15
             G = nx.erdos_renyi_graph(
                 n_genes, p, directed=True,
@@ -102,29 +106,84 @@ def _generate_random_dag(
             G = nx.barabasi_albert_graph(
                 n_genes, m, seed=int(rng.integers(0, 2**31)),
             )
-            # Convert undirected to directed
             G = G.to_directed()
 
         G.remove_edges_from(nx.selfloop_edges(G))
 
-        # Orient edges to form DAG using random topological order
-        order = rng.permutation(n_genes)
-        rank = np.empty(n_genes, dtype=int)
-        rank[order] = np.arange(n_genes)
+        if allow_cycles:
+            # Keep directed edges as-is (naturally has cycles)
+            # Filter to match edge count constraints
+            result = nx.DiGraph()
+            result.add_nodes_from(range(n_genes))
+            edges = list(G.edges())
+            rng.shuffle(edges)
 
-        dag = nx.DiGraph()
-        dag.add_nodes_from(range(n_genes))
-        for u, v in G.edges():
-            if rank[u] < rank[v]:
-                dag.add_edge(u, v)
+            # Add edges up to max, keeping connectivity
+            for u, v in edges:
+                if result.number_of_edges() >= max_edges:
+                    break
+                result.add_edge(u, v)
 
-        n_edges = dag.number_of_edges()
-        active_tfs = sum(1 for nd in dag.nodes() if dag.out_degree(nd) > 0)
+            n_edges = result.number_of_edges()
+            active_tfs = sum(
+                1 for nd in result.nodes() if result.out_degree(nd) > 0
+            )
 
-        if min_edges <= n_edges <= max_edges and active_tfs >= min_tfs:
-            return dag
+            if not (min_edges <= n_edges <= max_edges
+                    and active_tfs >= min_tfs):
+                continue
 
-    # Fallback: return last attempt regardless
+            # Check cycle statistics match DREAM4 range:
+            # ~30-60% edges in cycles, at least 1 non-trivial SCC
+            sccs = [
+                s for s in nx.strongly_connected_components(result)
+                if len(s) > 1
+            ]
+            if not sccs:
+                continue
+
+            # Count edges in cycles
+            cycle_nodes = set()
+            for scc in sccs:
+                cycle_nodes.update(scc)
+            edges_in_cycles = sum(
+                1 for u, v in result.edges()
+                if u in cycle_nodes and v in cycle_nodes
+            )
+            cycle_frac = edges_in_cycles / max(1, n_edges)
+
+            # DREAM4 stats: 31-62% edges in cycles, SCCs of size 2-6
+            max_scc = max(len(s) for s in sccs)
+            if cycle_frac < 0.20 or cycle_frac > 0.70:
+                continue
+            if max_scc > n_genes * 0.7:
+                # Reject if too many nodes in one SCC (unrealistic)
+                continue
+
+            return result
+        else:
+            # Original DAG orientation via topological order
+            order = rng.permutation(n_genes)
+            rank = np.empty(n_genes, dtype=int)
+            rank[order] = np.arange(n_genes)
+
+            dag = nx.DiGraph()
+            dag.add_nodes_from(range(n_genes))
+            for u, v in G.edges():
+                if rank[u] < rank[v]:
+                    dag.add_edge(u, v)
+
+            n_edges = dag.number_of_edges()
+            active_tfs = sum(
+                1 for nd in dag.nodes() if dag.out_degree(nd) > 0
+            )
+
+            if min_edges <= n_edges <= max_edges and active_tfs >= min_tfs:
+                return dag
+
+    # Fallback: return last attempt
+    if allow_cycles:
+        return result
     return dag
 
 
@@ -134,7 +193,7 @@ def _dag_to_tsv(
     rng: np.random.Generator,
     activation_prob: float = 0.6,
 ) -> None:
-    """Write a DAG as GNW-compatible TSV with random edge signs."""
+    """Write a directed network (DAG or cyclic) as GNW-compatible TSV."""
     with open(path, "w") as f:
         for u, v in dag.edges():
             sign = "+" if rng.random() < activation_prob else "-"
@@ -212,6 +271,7 @@ def generate_gnw_dataset(
     graph_type: str = "erdos_renyi",
     rng: np.random.Generator | None = None,
     dream4_size10: bool = False,
+    allow_cycles: bool = False,
 ) -> SCMDataset | None:
     """Generate one GRN dataset using GeneNetWeaver.
 
@@ -221,7 +281,7 @@ def generate_gnw_dataset(
         Number of genes in the network.
     mode : "bio" or "synthetic"
         "bio": extract subnetwork from a real organism network.
-        "synthetic": generate random DAG, simulate with GNW dynamics.
+        "synthetic": generate random directed network, simulate with GNW dynamics.
     source_network : str, optional
         For bio mode: which source network to use.
         If None, randomly chosen from available sources.
@@ -238,6 +298,9 @@ def generate_gnw_dataset(
         - Variable activation/repression ratio (33-53%)
         - No self-interactions in bio mode
         - Prefer cycles in subnetwork extraction
+    allow_cycles : bool
+        If True, generate cyclic directed graphs matching DREAM4-10 cycle
+        statistics (~30-60% edges in cycles). If False, force acyclic DAGs.
 
     Returns
     -------
@@ -298,6 +361,7 @@ def generate_gnw_dataset(
         else:  # synthetic
             dag = _generate_random_dag(
                 n_genes, rng, graph_type, dream4_size10=dream4_size10,
+                allow_cycles=allow_cycles,
             )
             tsv_path = os.path.join(tmpdir, "network.tsv")
             # DREAM4-10 activation ratio: 33-53% (sampled per network)
